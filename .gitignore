@@ -1,0 +1,26 @@
+# Copyright (c) 2026 Furkan Selim Cetin <mail@furkancetin.dev>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Developed at the German Cancer Research Center (DKFZ).
+
+sync_script.sh
+data
+models
+.sync_files
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.ipynb_checkpoints/
+.venv
+.pytest_cache
+.cache/
+artifact/
+build/
+build_data_ingest/
+AGENTS.md
+.codex
+.vscode
+.sync_overrides/
+.sync_overrides.README.md
+.public-sync-stage.*/
+/build_native/

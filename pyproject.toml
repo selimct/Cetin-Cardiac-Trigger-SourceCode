@@ -1,0 +1,68 @@
+# Copyright (c) 2026 Furkan Selim Cetin <mail@furkancetin.dev>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Developed at the German Cancer Research Center (DKFZ).
+
+[build-system]
+requires = ["setuptools>=69", "wheel", "pybind11>=2.12"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dkfz"
+version = "1.2.0-rc1"
+description = "ECG R peak detection utilities and live inference code"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+authors = [
+  { name = "Furkan Selim Cetin" }
+]
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ipykernel",
+  "ipympl",
+  "ipython",
+  "matplotlib",
+  "mplhep",
+  "pytest",
+  "pytest-cov",
+  "black",
+]
+torch = [
+  "torch",
+]
+train = [
+  "matplotlib",
+  "mplhep",
+  "pyarrow",
+  "torch",
+]
+analysis = [
+  "matplotlib",
+  "mplhep",
+  "pyarrow",
+]
+onnx = [
+  "onnx",
+  "onnxruntime",
+  "onnxscript",
+]
+test = [
+  "pytest",
+  "pytest-cov",
+  "torch",
+  "pyarrow",
+  "matplotlib",
+  "mplhep",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,68 @@
+name: Build and distribution check
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-check:
+    name: Public files and GUI compatibility / Python 3.11
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_CACHE_DIR: "1"
+      MPLBACKEND: Agg
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - name: Check out the public backend
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read the current public GUI's backend requirements
+        uses: actions/checkout@v7
+        with:
+          repository: selimct/DKFZ-MRI-Cardiac-Trigger-GUI
+          ref: main
+          path: build/trigger-gui
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential cmake
+
+      - name: Install public dependencies and compile the Python extension
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install "setuptools>=69" wheel "pybind11>=2.12" build
+          .venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          .venv/bin/python -m pip install --no-build-isolation --editable ".[train,onnx]"
+
+      - name: Check that the source package and wheel can be built
+        run: .venv/bin/python -m build --no-isolation
+
+      # Match the GUI's build directory and legacy --test argument. Public
+      # builds accept that flag without running the development test suite.
+      - name: Compile the public native runtime
+        run: bash run/build_native.sh --tensorrt off --test
+
+      - name: Check the GUI's incremental rebuild command
+        run: bash run/rebuild_native.sh --target native_uart_live_runtime
+
+      - name: Check included files, imports, and GUI command interfaces
+        run: .venv/bin/python .github/scripts/check_distribution.py --gui-source build/trigger-gui

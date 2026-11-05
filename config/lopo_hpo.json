@@ -1,0 +1,43 @@
+{
+  "method": "random",
+  "num_trials": 4,
+  "seed": 42,
+  "baseline": {
+    "name": "current_default",
+    "parameters": {
+      "lr": 0.002884760125018128,
+      "hidden_dim": 64,
+      "num_layers": 2,
+      "window_size": 50
+    }
+  },
+  "fixed": {
+    "batch_size": 256,
+    "num_epochs": 35,
+    "threshold_objective": "min_error",
+    "threshold_sensitivity_efficiency": 0.95
+  },
+  "search_space": {
+    "lr": {
+      "type": "log_uniform",
+      "low": 0.0005,
+      "high": 0.005
+    },
+    "hidden_dim": {
+      "type": "categorical",
+      "values": [32, 64]
+    },
+    "num_layers": {
+      "type": "categorical",
+      "values": [1, 2]
+    },
+    "window_size": {
+      "type": "categorical",
+      "values": [25, 50]
+    }
+  },
+  "selection": {
+    "metric": "weighted_detection_error",
+    "direction": "minimize"
+  }
+}

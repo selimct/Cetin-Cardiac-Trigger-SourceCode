@@ -1,0 +1,50 @@
+# Copyright (c) 2026 Furkan Selim Cetin <mail@furkancetin.dev>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Developed at the German Cancer Research Center (DKFZ).
+
+[Unit]
+Description=DKFZ integrated UART TensorRT live inference
+After=dev-ttyTHS1.device
+Wants=dev-ttyTHS1.device
+
+[Service]
+Type=notify
+User=dkfz-live
+Group=dkfz-live
+SupplementaryGroups=dialout gpio video render
+WorkingDirectory=/opt/dkfz-live
+StateDirectory=dkfz-live
+StateDirectoryMode=0750
+ExecStart=/opt/dkfz-live/build_native/inference/native_uart_live_runtime --config /opt/dkfz-live/config/native_uart_live.conf
+Restart=on-failure
+RestartSec=1s
+RestartPreventExitStatus=2
+WatchdogSec=5s
+TimeoutStopSec=5s
+KillSignal=SIGTERM
+
+Nice=-5
+CPUWeight=200
+IOWeight=200
+
+# Production trigger output is GPIO; stdout JSONL is disabled.
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=dkfz-native-live
+# Keep this always-on service's logs independent from the host journal. The
+# matching journald@dkfz-live.conf enforces fixed disk and volatile-memory caps.
+LogNamespace=dkfz-live
+# Preserve normal diagnostics while bounding an accidental high-rate log storm.
+LogRateLimitIntervalSec=1min
+LogRateLimitBurst=120
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# Consume the checkout in place without allowing the service to modify it.
+BindReadOnlyPaths=/home/orin/work/live_stack:/opt/dkfz-live
+ReadWritePaths=/var/lib/dkfz-live
+
+[Install]
+WantedBy=multi-user.target
