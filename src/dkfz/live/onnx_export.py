@@ -16,7 +16,6 @@ import torch
 from dkfz.core.model import ECG_RNN
 from dkfz.live.model_variants import default_config_path, require_config_modelname
 
-
 DEFAULT_ONNX_OPSET = 18
 
 
@@ -39,10 +38,14 @@ def load_train_config(
     model_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Load a training config and verify its declared model identity."""
-    config_path = Path(config) if config is not None else default_config_path(
-        modelname,
-        model_variant,
-        model_dir,
+    config_path = (
+        Path(config)
+        if config is not None
+        else default_config_path(
+            modelname,
+            model_variant,
+            model_dir,
+        )
     )
     with config_path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -60,6 +63,9 @@ def build_model_from_config(
     map_location: str | torch.device = "cpu",
 ) -> ECG_RNN:
     """Construct ECG_RNN from config and load a checkpoint state dict."""
+    from dkfz.live.prediction_contract import prediction_delay
+
+    prediction_delay(cfg)
     input_dim = int(cfg.get("input_dim") or len(cfg["feature_cols"]))
     hidden_dim = int(cfg["hidden_dim"])
     num_layers = int(cfg["num_layers"])
@@ -67,6 +73,8 @@ def build_model_from_config(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
+        recovery_head=bool(cfg.get("recovery_head", False)),
+        prediction_delay_frames=int(cfg.get("prediction_delay_frames", 0)),
     )
     state_dict = torch.load(checkpoint, map_location=map_location)
     model.load_state_dict(state_dict)
@@ -129,4 +137,33 @@ def export_model_onnx(
             do_constant_folding=True,
             dynamic_shapes=dynamic_shapes,
         )
+    import onnx
+
+    graph = onnx.load(str(output))
+    properties = {item.key: item.value for item in graph.metadata_props}
+    delay = int(getattr(model, "prediction_delay_frames", 0))
+    properties.update(
+        {
+            "dkfz.prediction_delay_frames": str(delay),
+            "dkfz.prediction_mode": "delayed_100hz" if delay else "current",
+        }
+    )
+    onnx.helper.set_model_props(graph, properties)
+    onnx.save(graph, str(output))
     return output
+
+
+def validate_onnx_prediction_contract(cfg, path):
+    import onnx
+    from dkfz.live.prediction_contract import prediction_delay
+
+    delay = prediction_delay(cfg)
+    properties = {item.key: item.value for item in onnx.load(str(path)).metadata_props}
+    saved = properties.get("dkfz.prediction_delay_frames")
+    if (delay and saved is None) or (saved is not None and saved != str(delay)):
+        raise ValueError(
+            "ONNX primary-target contract differs from the model configuration; re-export from the correct trained model"
+        )
+    mode = properties.get("dkfz.prediction_mode")
+    if mode is not None and mode != cfg.get("prediction_mode", "current"):
+        raise ValueError("ONNX prediction mode differs from the model configuration")

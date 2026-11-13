@@ -23,7 +23,9 @@ build_dir="${repo_root}/build_native"
 deploy_dir="${MODEL_DEPLOY_DIR:-${repo_root}/deploy/model}"
 service_name="dkfz-native-uart-live.service"
 dry_run=0
+disable_recovery=0
 stage_dir=""
+validated_report=""
 
 usage() {
     cat <<'USAGE'
@@ -42,6 +44,9 @@ Options:
   --engine PATH         Use an existing Jetson engine instead of building one.
   --checkpoint PATH     Check staged TensorRT logits against this checkpoint.
   --prepped-file PATH   Use saved feature windows for TensorRT parity.
+  --validated-report PATH  Fingerprinted report from isolated preparation.
+                        Required for delayed 100 Hz activation.
+  --no-recovery         Disable recovery events while keeping the two-output engine.
   --precision MODE      Engine precision: auto, fp16, or fp32. Default: auto.
                         auto retries a failed FP16 parity check in strict FP32.
   --python PATH         Manifest-export Python. Default:
@@ -135,10 +140,19 @@ while [[ $# -gt 0 ]]; do
             prepped_file="$2"
             shift 2
             ;;
+        --validated-report)
+            require_value "$1" "${2:-}"
+            validated_report="$2"
+            shift 2
+            ;;
         --precision)
             require_value "$1" "${2:-}"
             precision="${2,,}"
             shift 2
+            ;;
+        --no-recovery)
+            disable_recovery=1
+            shift
             ;;
         --python)
             require_value "$1" "${2:-}"
@@ -232,6 +246,12 @@ configured_model_name="$(
 )"
 [[ "${configured_model_name}" == "${model_name}" ]] || die \
     "training config declares modelname=${configured_model_name:-<missing>}, expected ${model_name}"
+prediction_mode="$("${python_bin}" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("prediction_mode","current"))' "${config_path}")"
+if [[ "${prediction_mode}" == delayed_100hz ]]; then
+    [[ -n "${validated_report}" && -n "${engine_source}" ]] || die \
+        "Delayed activation requires an isolated prepared engine and --validated-report; use prepare_model.sh --prepare-only first"
+    [[ -n "${checkpoint_path}" ]] || die "Delayed activation requires the matching checkpoint"
+fi
 if [[ -n "${engine_source}" ]]; then
     [[ "${onnx_explicit}" -eq 0 ]] || die \
         "--onnx and --engine are mutually exclusive"
@@ -241,6 +261,18 @@ if [[ -n "${engine_source}" ]]; then
 else
     require_source_artifact "ONNX model" "${onnx_path}"
 fi
+if [[ -n "${validated_report}" ]]; then
+    report_args=(--report "${validated_report}" --config "${config_path}" --engine "${engine_source}" --model-variant "${variant}")
+    [[ -z "${checkpoint_path}" ]] || report_args+=(--checkpoint "${checkpoint_path}")
+    (( ! disable_recovery )) || report_args+=(--no-recovery)
+    run_command "${python_bin}" "${repo_root}/run/check_prepared_model.py" "${report_args[@]}"
+fi
+
+contract_args=(--config "${config_path}")
+if [[ -z "${engine_source}" ]]; then
+    contract_args+=(--onnx "${onnx_path}")
+fi
+run_command "${python_bin}" "${repo_root}/run/check_prediction_contract.py" "${contract_args[@]}"
 
 if command -v systemctl >/dev/null 2>&1; then
     service_state="$(systemctl is-active "${service_name}" 2>/dev/null || true)"
@@ -329,6 +361,10 @@ fi
 # Generate the manifest only after the final engine has passed parity, since an
 # automatic FP32 rebuild changes both the engine size and its fingerprint.
 printf 'Generating fingerprinted native manifest\n'
+manifest_args=()
+if (( disable_recovery )); then
+    manifest_args+=(--no-recovery)
+fi
 run_command "${python_bin}" \
     "${repo_root}/run/jetson_export_native_manifest.py" \
     --modelname "${model_name}" \
@@ -337,7 +373,8 @@ run_command "${python_bin}" \
     --allow-engine-outside-model-dir \
     --config "${config_path}" \
     --engine "${stage_engine}" \
-    --output "${stage_manifest}"
+    --output "${stage_manifest}" \
+    "${manifest_args[@]}"
 
 printf 'Validating staged manifest and TensorRT engine\n'
 run_command "${runtime}" \
@@ -345,6 +382,14 @@ run_command "${runtime}" \
     --manifest "${stage_manifest}" \
     --validate-only \
     --check-engine
+
+if [[ -n "${validated_report}" ]]; then
+    # Recheck the staged engine after copying and native validation.
+    staged_report_args=(--report "${validated_report}" --config "${config_path}" --engine "${stage_engine}" --model-variant "${variant}")
+    [[ -z "${checkpoint_path}" ]] || staged_report_args+=(--checkpoint "${checkpoint_path}")
+    run_command "${python_bin}" "${repo_root}/run/check_prepared_model.py" \
+        "${staged_report_args[@]}" "${manifest_args[@]}"
+fi
 
 printf 'Activating deploy/model\n'
 if [[ "${dry_run}" -eq 1 ]]; then

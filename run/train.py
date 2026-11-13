@@ -5,7 +5,7 @@
 """Train an ECG_RNN using the same feature path used during live prediction.
 
 This script reads annotated parquet files at raw sample rate, converts them into
-causal live-style 50 Hz feature frames, trains an LSTM classifier, evaluates a
+causal live-style model-rate feature frames, trains an LSTM classifier, evaluates a
 threshold, and writes:
 
 - `models/<modelname>/best.pth`
@@ -127,7 +127,16 @@ def live_training(
     prepped_file: str | None = None,
     prep_workers: int | None = None,
     debug_timing: bool | None = None,
+    plots: bool | None = None,
     threshold_inputs: list[str] | None = None,
+    recovery_head: bool | None = None,
+    recovery_max_fp_increase: float | None = None,
+    recovery_min_extra_fp_per_minute: float | None = None,
+    cache_frozen_recovery: bool | None = None,
+    prediction_mode: str | None = None,
+    prediction_delay_frames: int | None = None,
+    signal_quality_puls_flat_window_frames: int | None = None,
+    signal_quality_puls_median_window_frames: int | None = None,
 ):
     """Train and evaluate a live-style ECG trigger model.
 
@@ -141,7 +150,7 @@ def live_training(
         lr: Learning rate.
         hidden_dim: LSTM hidden dimension.
         num_layers: Number of LSTM layers.
-        window_size: Number of 50 Hz frames per model input window.
+        window_size: Number of model frames per model input window.
         num_epochs: Maximum training epochs.
         batch_size: DataLoader batch size.
         seed: Base random seed for Python, NumPy, PyTorch, and CUDA.
@@ -189,14 +198,15 @@ def live_training(
             exact-frame sensitivity retained as the selection floor.
         use_amp: Use mixed precision where supported.
         save_last: Save the final epoch weights to `models/<modelname>/last.pth`.
-        save_prepped: Save the preprocessed 50 Hz feature rows to parquet.
-        use_prepped: Load preprocessed 50 Hz feature rows instead of rebuilding
+        save_prepped: Save the preprocessed model-rate feature rows to parquet.
+        use_prepped: Load preprocessed model-rate feature rows instead of rebuilding
             them from raw-rate parquet files.
         prepped_file: Path used by `save_prepped` or `use_prepped`. Defaults to
             `models/<modelname>/prepped.parquet`.
         prep_workers: Number of worker processes for raw parquet preprocessing.
             Use 0 to use all available CPU cores. Ignored with `use_prepped`.
         debug_timing: Print elapsed timings between major training phases.
+        plots: Write report plots. None defaults off on Jetson and on elsewhere.
     """
     explicit_values = locals().copy()
     config_values = _load_training_config_values(config)
@@ -264,6 +274,9 @@ def live_training(
 
     start_time = time.time()
     timing = DebugTimer(debug_timing)
+    from dkfz.live.prediction_contract import check_training_destination
+
+    check_training_destination(Path("models") / modelname, kwargs)
     model_dir = ensure_dir(Path("models") / modelname)
     ensure_dir(model_dir / "metrics")
 
@@ -307,6 +320,8 @@ def live_training(
         window_size=window_size,
         batch_size=batch_size,
         timing=timing,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     device = default_torch_device()
     model = build_ecg_rnn(
@@ -314,9 +329,15 @@ def live_training(
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         device=device,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
 
     criterion = nn.BCEWithLogitsLoss()
+    if kwargs.get("recovery_only"):
+        raise ValueError(
+            "Use run/train_finetune.py --recovery-only with an existing checkpoint"
+        )
     timing.mark("initialized model")
     train_torch(
         model,
@@ -340,11 +361,17 @@ def live_training(
         num_layers=num_layers,
         device=device,
         checkpoint_path=model_dir / "best.pth",
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     timing.mark("loaded best checkpoint")
 
     threshold_selection = evaluate_and_write_live_artifacts(
         model=saved_model,
+        recovery_max_fp_increase=float(kwargs.get("recovery_max_fp_increase", 0.10)),
+        recovery_min_extra_fp_per_minute=float(
+            kwargs.get("recovery_min_extra_fp_per_minute", 0.5)
+        ),
         loader=val_loader,
         dataset=val_dataset,
         model_dir=model_dir,
@@ -359,6 +386,7 @@ def live_training(
         device=device,
         use_amp=use_amp,
         timing=timing,
+        plots=kwargs["plots"],
     )
     best_threshold = threshold_selection.threshold
 
@@ -382,14 +410,17 @@ def live_training(
             "train_threshold_search_file": str(
                 model_dir / "metrics/train_threshold_search.csv"
             ),
-            "train_threshold_dashboard_file": str(
-                model_dir / "metrics/train_threshold_dashboard.pdf"
-            ),
-            "train_threshold_error_examples_file": str(
-                model_dir / "metrics/train_threshold_errors.pdf"
-            ),
         }
     )
+    if metadata["plots_enabled"]:
+        metadata.update(
+            train_threshold_dashboard_file=str(
+                model_dir / "metrics/train_threshold_dashboard.pdf"
+            ),
+            train_threshold_error_examples_file=str(
+                model_dir / "metrics/train_threshold_errors.pdf"
+            ),
+        )
     write_metadata(model_dir / "train_config.json", metadata)
     timing.mark("wrote training config")
 
@@ -405,6 +436,9 @@ if __name__ == "__main__":
     # CLI wrapper around `live_training`. Defaults are chosen for 400 Hz raw
     # data framed to 50 Hz with 8 samples per frame.
     parser = argparse.ArgumentParser()
+    from dkfz.live.training_config import add_prediction_training_arguments
+
+    add_prediction_training_arguments(parser)
     parser.add_argument(
         "inputs", nargs="*", help="Parquet files, directories, or globs."
     )
@@ -579,7 +613,7 @@ if __name__ == "__main__":
         action="store_true",
         dest="save_prepped",
         default=None,
-        help="Save preprocessed 50 Hz feature frames to parquet.",
+        help="Save preprocessed model-rate feature frames to parquet.",
     )
     parser.add_argument(
         "--no-save-prepped",
@@ -591,7 +625,7 @@ if __name__ == "__main__":
         action="store_true",
         dest="use_prepped",
         default=None,
-        help="Load preprocessed 50 Hz feature frames instead of rebuilding them.",
+        help="Load preprocessed model-rate feature frames instead of rebuilding them.",
     )
     parser.add_argument(
         "--no-use-prepped",
@@ -627,5 +661,8 @@ if __name__ == "__main__":
         dest="debug_timing",
     )
 
+    from dkfz.live.training_config import add_recovery_training_arguments
+
+    add_recovery_training_arguments(parser, fine_tune=False)
     args = parser.parse_args()
     live_training(**vars(args))

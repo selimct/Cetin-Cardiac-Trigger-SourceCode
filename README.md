@@ -15,6 +15,12 @@ This project presents a machine-learning-based hybrid ECG-POX R-peak detector fo
 
 The repository includes the research workflow and the real-time triggering system, from recorded physiological signals to a trained model and its use during live acquisition.
 
+This public distribution includes setup, data preparation, model training,
+evaluation, deployment and live operation. Recordings and trained model
+artifacts are supplied separately; `models/`, `finished_models/` and metric
+outputs are created or populated by the user. Development test suites,
+internal patches and deprecated executables are omitted.
+
 ## Project scope
 
 - **Data preparation:** converting recordings and preparing reviewed R-peak
@@ -35,6 +41,47 @@ with the Trigger GUI.
 - [Hardware connections and Jetson setup](docs/hardware.md)
 - [Annotated data and leave-one-patient-out training](docs/training.md)
 - [Terminal alternatives](docs/terminal.md)
+- [Optional 100 Hz previous-frame predictor](docs/100hz-delayed-target.md)
+
+## Prediction metrics
+
+Run the preferred six-recording benchmark from the project root:
+
+```bash
+./metrics.sh normal
+./metrics.sh synthetic
+```
+
+Both commands evaluate every published model in `finished_models/`, including
+normal models and their recovery and `delayed_100hz/` variants. They use p02 head,
+p14 heart/head,
+and p16 head/heart/pelvis. `./metrics.sh` defaults to the normal run.
+
+Both modes use `--only-missing`. By default, full prediction/event parquets are
+temporary; small score/annotation caches under `metrics/.cache/` allow reports
+and plots to be rebuilt without repeating inference. Synthetic runs do not save
+modified source recordings by default.
+
+Add `--save-prepped` to keep full prediction/event parquets. Normal outputs go
+under `metrics/prepped/<model>/`; synthetic outputs go under
+`metrics/prepped/synthetic/main_<frequency>hz/<model>/`. Matching saved files
+are reused on subsequent runs. Changing input data, model weights, or prediction
+settings invalidates the cache; changing only this saving flag does not.
+Prediction caches track runtime settings and inference/native code separately
+from training settings and calibration audit metadata. Plot-only changes rebuild
+plots while reusing predictions. A newly selected recovery threshold still
+invalidates that model's predictions and reports.
+If only a compact cache exists, the first `--save-prepped` run repeats inference
+once to produce the full files; subsequent matching runs reuse them.
+
+Reports go under `metrics/` for normal runs and `metrics/synthetic/` for synthetic
+runs. Each has `prediction_metrics_overview.{txt,csv}` for pooled results and
+`prediction_metrics_per_input.{txt,csv}` for per-input comparisons. Synthetic
+reports group results by gradient frequency.
+
+Append options from `create_prediction_metrics.sh` to either command, for example
+`./metrics.sh normal --model ecg3 --model ecg3_recovery`. Use `--dry-run` to
+print the expanded command, or `--help` for the shortcut options.
 
 ## Authorship
 

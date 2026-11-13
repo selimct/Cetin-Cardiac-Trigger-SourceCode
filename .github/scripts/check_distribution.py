@@ -33,6 +33,23 @@ PYTHON_COMMANDS = (
     "run/create_prediction_plots.py",
     "run/create_prediction_metrics_overview.py",
     "run/post_reselect_thresholds.py",
+    "run/post_backfill_thresholds.py",
+    "run/train_finetune.py",
+    "run/train_recovery_lopo.py",
+    "run/train_lopo_hpo.py",
+    "run/calibrate_recovery.py",
+    "run/prep_read_log_to_parquet.py",
+    "run/io_uart_bytes_to_parquet.py",
+    "run/create_model_table.py",
+    "run/compare_prediction_models.py",
+    "run/offline_predict_trt.py",
+    "run/check_prepared_model.py",
+    "run/jetson_check_native_runtime_parity.py",
+    "run/jetson_prepare_model.py",
+    "run/jetson_paced_uart_check.py",
+    "run/jetson_qualify_model.py",
+    "run/set_live_threshold.py",
+    "run/summarize_inference_latency.py",
 )
 SHELL_COMMANDS = (
     "setup.sh",
@@ -43,6 +60,7 @@ SHELL_COMMANDS = (
     "run/jetson_build_trt_engine.sh",
 )
 GENERATED_MODEL_FILES = {"deploy/model/model.conf", "deploy/model/model.engine"}
+GENERATED_MODEL_DIRECTORIES = ("build_native/prepared_models/",)
 GUI_PATH = re.compile(
     r"(?<![\w./-])(?:run/[\w./-]+\.(?:sh|py)|prepare_model\.sh|"
     r"build_native/[\w./-]+|config/[\w./-]+\.conf|"
@@ -86,7 +104,9 @@ def check_python_sources() -> None:
                 dependencies.update(node.module + "." + alias.name for alias in node.names
                                     if alias.name == "_live_core")
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if re.fullmatch(r"dkfz(?:\.[A-Za-z_]\w*)+", node.value):
+                # Lazy imports name a package. ONNX metadata also uses the
+                # dkfz prefix (e.g. dkfz.prediction_mode), but is not a module.
+                if re.fullmatch(r"dkfz\.(?:core|live|native)(?:\.[A-Za-z_]\w*)*", node.value):
                     dependencies.add(node.value)
         for name in sorted(dependencies):
             if name != "dkfz" and not name.startswith("dkfz."):
@@ -117,6 +137,8 @@ def check_gui_files(gui_source: Path) -> None:
              "build_native/inference/native_uart_live_runtime"}.issubset(references),
             "GUI backend layout changed; review its file interfaces before publishing")
     for relative in sorted(references - GENERATED_MODEL_FILES):
+        if relative.startswith(GENERATED_MODEL_DIRECTORIES):
+            continue
         require_file(relative, executable=relative.endswith(".sh") or
                      relative == "build_native/inference/native_uart_live_runtime")
     print(f"PASS: backend file paths used by the public GUI are present ({len(references)} references)", flush=True)
@@ -139,6 +161,7 @@ def main() -> None:
     cmake = (ROOT / "native/CMakeLists.txt").read_text()
     for relative in re.findall(r"\b(?:live_core|live_runtime|uart|python)/[\w./-]+\.(?:cpp|hpp)\b", cmake):
         require_file("native/" + relative)
+    require_file("native/uart_receiver_stream.cpp")
     print("PASS: native build sources are included, including the TensorRT branch", flush=True)
     for relative in PYTHON_COMMANDS:
         command(sys.executable, str(ROOT / relative), "--help")
@@ -164,6 +187,11 @@ def main() -> None:
     for flag in ("--config", "--manifest", "--trigger-output", "--capture-byte-file",
                  "--emit-probabilities", "--validate-only", "--check-engine"):
         require(flag in output, f"GUI requires missing native runtime option: {flag}")
+    # The recovery helper is a service API without a --help mode. Checking its
+    # executable is sufficient here; invoking it would query the host service.
+    require_file("build_native/inference/native_live_recovery_control", executable=True)
+    for relative in ("inference/native_live_runtime", "uart/uart_receiver_stream"):
+        command(str(ROOT / "build_native" / relative), "--help")
     config = (ROOT / "config/native_uart_live.conf").read_text()
     require(re.search(r"^manifest_path=deploy/model/model\.conf$", config, re.MULTILINE) is not None,
             "Runtime config does not use the GUI's stable model slot")

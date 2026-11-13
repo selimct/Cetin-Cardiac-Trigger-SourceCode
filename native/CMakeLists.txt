@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(dkfz_live_native LANGUAGES CXX)
 
-# Tests are maintained in the development repository.
+# Development tests are maintained upstream.
 set(BUILD_TESTING OFF CACHE BOOL "Tests are not included in this distribution" FORCE)
 find_package(Threads REQUIRED)
 
@@ -107,6 +107,7 @@ add_library(
         live_runtime/src/threshold_override.cpp
         live_runtime/src/runtime_health.cpp
         live_runtime/src/systemd_notify.cpp
+        live_runtime/src/thread_scheduling.cpp
         ${_dkfz_inference_engine_source}
 )
 target_compile_features(dkfz_live_runtime_core PUBLIC cxx_std_17)
@@ -171,6 +172,26 @@ target_link_libraries(
 )
 
 add_executable(
+    native_live_runtime
+    live_runtime/native_live_runtime.cpp
+)
+target_compile_features(native_live_runtime PRIVATE cxx_std_17)
+target_compile_options(
+    native_live_runtime
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+)
+target_link_libraries(native_live_runtime PRIVATE dkfz_live_runtime_core)
+set_target_properties(
+    native_live_runtime
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/inference"
+)
+
+add_executable(
     native_uart_live_runtime
     live_runtime/native_uart_live_runtime.cpp
 )
@@ -193,7 +214,40 @@ set_target_properties(
     PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/inference"
 )
 
+add_executable(uart_receiver_stream uart_receiver_stream.cpp)
+target_compile_features(uart_receiver_stream PRIVATE cxx_std_17)
+target_compile_options(
+    uart_receiver_stream
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+)
+target_link_libraries(uart_receiver_stream PRIVATE dkfz_uart_core)
+
+set_target_properties(
+    uart_receiver_stream
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/uart"
+)
+
 install(
-    TARGETS native_uart_live_runtime
+    TARGETS
+        uart_receiver_stream
+        native_live_runtime
+        native_uart_live_runtime
     RUNTIME DESTINATION bin
 )
+
+# Deployment-native administration API; no Python or TensorRT dependency.
+add_executable(native_live_recovery_control live_runtime/native_live_recovery_control.cpp)
+target_compile_features(native_live_recovery_control PRIVATE cxx_std_17)
+target_include_directories(native_live_recovery_control PRIVATE live_runtime/include)
+target_compile_options(native_live_recovery_control PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(native_live_recovery_control PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/inference")
+# The GUI's existing runtime rebuild targets native_uart_live_runtime alone.
+# Keep the on-demand control executable in sync through that same build.
+add_dependencies(native_uart_live_runtime native_live_recovery_control)
+
+install(TARGETS native_live_recovery_control RUNTIME DESTINATION bin)

@@ -12,13 +12,13 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from dkfz.live.feature_framing import (
-    PREPROCESSING_CONTRACT_VERSION,
-    live_feature_columns,
-)
-from dkfz.live.model_variants import DEFAULT_MODEL_VARIANT
+from dkfz.live.feature_framing import live_feature_columns
+from dkfz.live.model_variants import DEFAULT_MODEL_VARIANT, get_model_variant
+from dkfz.live.runtime_config import effective_recovery_threshold
+from dkfz.live.prediction_contract import prediction_delay, supported_preprocessing_contract
 
 DEPLOYMENT_MANIFEST_SCHEMA = "dkfz-live-deployment-v1"
+DELAYED_DEPLOYMENT_MANIFEST_SCHEMA = "dkfz-live-deployment-v2"
 
 
 def default_native_manifest_path(
@@ -27,11 +27,9 @@ def default_native_manifest_path(
     model_dir: str | Path | None = None,
 ) -> Path:
     """Return the default native manifest path for a trained variant."""
-    variant = model_variant or DEFAULT_MODEL_VARIANT
-    artifact_root = (
-        Path(model_dir) if model_dir is not None else Path("models") / str(modelname)
-    )
-    return artifact_root / f"{modelname}_{variant}_native.conf"
+    variant = get_model_variant(model_variant)
+    artifact_root = variant.model_dir(modelname, model_dir)
+    return artifact_root / f"{modelname}_{variant.name}_native.conf"
 
 
 def _require(cfg: dict[str, Any], key: str) -> Any:
@@ -84,7 +82,7 @@ def _holdoff_frames(cfg: dict[str, Any]) -> int:
     else:
         raw_hz = float(_require(cfg, "raw_hz"))
         frame_size = int(_require(cfg, "frame_size_raw"))
-        holdoff_ms = float(cfg.get("holdoff_ms", 180.0))
+        holdoff_ms = float(cfg.get("holdoff_ms", 200.0))
         value = int(math.ceil(holdoff_ms * (raw_hz / frame_size) / 1000.0))
     if value < 0:
         raise ValueError("holdoff_frames may not be negative.")
@@ -101,14 +99,7 @@ def native_manifest_values(
     engine_crc32: str | None = None,
 ) -> dict[str, str]:
     """Translate one training config to validated native manifest values."""
-    contract = int(
-        cfg.get("preprocessing_contract_version", PREPROCESSING_CONTRACT_VERSION)
-    )
-    if contract != PREPROCESSING_CONTRACT_VERSION:
-        raise ValueError(
-            f"preprocessing_contract_version={contract} is incompatible with "
-            f"native contract {PREPROCESSING_CONTRACT_VERSION}."
-        )
+    contract = supported_preprocessing_contract(cfg)
 
     include_puls = _include_puls(cfg)
     include_ecg3 = cfg.get("ecg3_col") is not None
@@ -141,8 +132,32 @@ def native_manifest_values(
             "signal_quality_mode is enabled but signal_quality_stats are missing."
         )
 
+    delay = prediction_delay(cfg)
+    recovery_threshold = effective_recovery_threshold(cfg)
     values = {
-        "schema": DEPLOYMENT_MANIFEST_SCHEMA,
+        "prediction_mode": cfg.get("prediction_mode", "current"),
+        "prediction_delay_frames": str(delay),
+        "signal_quality_puls_flat_window_frames": str(
+            int(cfg.get("signal_quality_puls_flat_window_frames", 10))
+        ),
+        "signal_quality_puls_median_window_frames": str(
+            int(cfg.get("signal_quality_puls_median_window_frames", 200))
+        ),
+        "recovery_head": _bool_text(cfg.get("recovery_head", False)),
+        "recovery_threshold": (
+            ""
+            if recovery_threshold is None
+            else _number_text(recovery_threshold, "recovery_threshold")
+        ),
+        "schema": (
+            DELAYED_DEPLOYMENT_MANIFEST_SCHEMA
+            if (
+                delay
+                or int(cfg.get("signal_quality_puls_flat_window_frames", 10)) != 10
+                or int(cfg.get("signal_quality_puls_median_window_frames", 200)) != 200
+            )
+            else DEPLOYMENT_MANIFEST_SCHEMA
+        ),
         "preprocessing_contract_version": str(contract),
         "model_name": _safe_scalar(cfg.get("modelname") or "target_r", "model_name"),
         "model_variant": _safe_scalar(model_variant, "model_variant"),
@@ -243,6 +258,15 @@ def native_manifest_values(
         values["source_model_dir"] = _safe_scalar(
             Path(source_model_dir).as_posix(), "source_model_dir"
         )
+    recovery = cfg.get("recovery_threshold")
+    if recovery is not None and (
+        not cfg.get("recovery_head") or not 0 < float(recovery) <= 1
+    ):
+        raise ValueError(
+            "recovery_threshold requires recovery_head and a value in (0, 1]"
+        )
+    if cfg.get("recovery_head") and int(cfg["window_size"]) < 2:
+        raise ValueError("recovery_head requires window_size >= 2")
     if engine_size_bytes is not None or engine_crc32 is not None:
         if engine_size_bytes is None or engine_crc32 is None:
             raise ValueError(

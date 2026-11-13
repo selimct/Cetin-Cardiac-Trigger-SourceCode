@@ -20,7 +20,6 @@ namespace dkfz::live
 
 inline constexpr const char *kDeploymentManifestSchema =
     "dkfz-live-deployment-v1";
-inline constexpr std::int64_t kPreprocessingContractVersion = 3;
 
 struct DeploymentManifest
 {
@@ -35,6 +34,10 @@ struct DeploymentManifest
     std::size_t window_size = 0;
     std::size_t input_dim = 0;
     double threshold = 0.5;
+    std::string prediction_mode = "current";
+    std::int64_t prediction_delay_frames = 0;
+    bool recovery_head = false;
+    std::optional<double> recovery_threshold;
     std::optional<double> manual_threshold;
     std::optional<double> fp_threshold;
     std::optional<double> der_threshold;
@@ -52,6 +55,7 @@ struct DeploymentManifest
     std::string time_field = "time_ms";
     std::string sample_index_field = "raw_idx";
     std::string sid_field = "sid";
+    std::int64_t preprocessing_contract_version = kPreprocessingContractVersion;
 };
 
 DeploymentManifest load_deployment_manifest(

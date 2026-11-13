@@ -15,7 +15,7 @@ SupplementaryGroups=dialout gpio video render
 WorkingDirectory=/opt/dkfz-live
 StateDirectory=dkfz-live
 StateDirectoryMode=0750
-ExecStart=/opt/dkfz-live/build_native/inference/native_uart_live_runtime --config /opt/dkfz-live/config/native_uart_live.conf
+ExecStart=/opt/dkfz-live/build_native/inference/native_uart_live_runtime --config /opt/dkfz-live/config/native_uart_live.conf --realtime-priority 20 --require-realtime
 Restart=on-failure
 RestartSec=1s
 RestartPreventExitStatus=2
@@ -24,8 +24,18 @@ TimeoutStopSec=5s
 KillSignal=SIGTERM
 
 Nice=-5
-CPUWeight=200
+CPUWeight=1000
 IOWeight=200
+# Candidate latency profile: qualify with isolated paced input before installing.
+# Only the runtime's acquisition, inference and output workers request RR.
+# Main/supervision and CUDA initialization retain normal scheduling; no broad
+# CAP_SYS_NICE grant, CPU pinning, global scheduler or clock changes are needed.
+CPUSchedulingPolicy=other
+LimitRTPRIO=20
+# Bound a realtime worker that fails to block normally. Healthy paced work
+# blocks between frames; retain the existing watchdog for stalled vendor I/O.
+LimitRTTIME=200ms
+TimerSlackNSec=1000
 
 # Production trigger output is GPIO; stdout JSONL is disabled.
 StandardOutput=null

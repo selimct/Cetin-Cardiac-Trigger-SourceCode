@@ -7,10 +7,26 @@
 from __future__ import annotations
 
 from typing import Any
+import argparse
+import math
 
 from dkfz.live.io import load_json_config
+from dkfz.live.training_plots import training_plots_enabled
+from dkfz.live.prediction_contract import (
+    apply_training_prediction_mode,
+    PREDICTION_MODES,
+)
 
 TRAINING_DEFAULTS = {
+    "prediction_mode": "current",
+    "prediction_delay_frames": 0,
+    "signal_quality_puls_flat_window_frames": 10,
+    "signal_quality_puls_median_window_frames": 200,
+    "recovery_head": False,
+    "recovery_only": False,
+    "cache_frozen_recovery": True,
+    "recovery_max_fp_increase": 0.10,
+    "recovery_min_extra_fp_per_minute": 0.5,
     "inputs": ["data/live/p*/*"],
     "threshold_inputs": ["data/live/sp*/*"],
     "modelname": "target_r",
@@ -53,7 +69,7 @@ TRAINING_DEFAULTS = {
     "puls_clip": True,
     "align_to_puls_blocks": True,
     "verify_puls_constant_within_block": False,
-    "min_distance": 20,
+    "min_distance": 10,
     "error_association_frames": 1,
     "threshold_objective": "min_error",
     "manual_threshold": None,
@@ -65,6 +81,7 @@ TRAINING_DEFAULTS = {
     "prepped_file": None,
     "prep_workers": 8,
     "debug_timing": False,
+    "plots": None,
 }
 
 
@@ -112,7 +129,101 @@ def training_kwargs_from_config_and_values(
         if values.get(key) is not None:
             kwargs[key] = values[key]
 
+    # Keep None portable when a saved config is used on another machine.
+    training_plots_enabled(kwargs["plots"])
+
     inputs = values.get("inputs") or cfg.get("inputs") or TRAINING_DEFAULTS["inputs"]
     kwargs["inputs"] = inputs
     kwargs["config"] = values.get("config")
+    apply_training_prediction_mode(kwargs, cfg, values)
+    from dkfz.live.event_matching import tp_tolerance_frames
+
+    if (
+        tp_tolerance_frames(float(kwargs["raw_hz"]) / int(kwargs["frame_size_raw"]))
+        and values.get("error_association_frames") is None
+    ):
+        if int(cfg.get("frame_size_raw", 8)) == 8:
+            kwargs["error_association_frames"] = (
+                2 * int(cfg.get("error_association_frames", 1)) + 1
+            )
+        elif int(cfg.get("metrics_schema_version", 0)) < 4:
+            kwargs["error_association_frames"] = 3
+        else:
+            kwargs["error_association_frames"] = int(
+                cfg.get("error_association_frames", 3)
+            )
+    if kwargs["recovery_only"] and not kwargs["recovery_head"]:
+        raise ValueError("recovery_only requires recovery_head=True")
+    if kwargs["recovery_head"] and int(kwargs["window_size"]) < 2:
+        raise ValueError("recovery_head requires window_size >= 2")
+    allowance = float(kwargs["recovery_max_fp_increase"])
+    if not math.isfinite(allowance) or allowance < 0:
+        raise ValueError("recovery_max_fp_increase must be finite and nonnegative")
+    rate = float(kwargs["recovery_min_extra_fp_per_minute"])
+    if not math.isfinite(rate) or rate < 0:
+        raise ValueError(
+            "recovery_min_extra_fp_per_minute must be finite and nonnegative"
+        )
     return kwargs
+
+
+def add_recovery_training_arguments(parser, *, fine_tune=False):
+    parser.add_argument(
+        "--recovery-min-extra-fp-per-minute",
+        type=float,
+        default=None,
+        help="Minimum extra recovery FP budget per evaluated validation minute; default 0.5 (one per two minutes).",
+    )
+    parser.add_argument(
+        "--cache-frozen-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Cache frozen representations for CPU recovery-only training (default: enabled).",
+    )
+    parser.add_argument(
+        "--recovery-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Add a previous-frame recovery output sharing the same LSTM pass.",
+    )
+    parser.add_argument(
+        "--recovery-max-fp-increase",
+        type=float,
+        default=None,
+        help="Relative validation FP allowance for recovery; default 0.10 (10%%).",
+    )
+    if fine_tune:
+        parser.add_argument(
+            "--recovery-only",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Freeze the original LSTM/current head and train only recovery.",
+        )
+
+
+def add_training_plot_arguments(parser):
+    parser.add_argument(
+        "--plots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write training report plots. Default: off on Jetson, on elsewhere.",
+    )
+
+
+def add_prediction_training_arguments(parser):
+    add_training_plot_arguments(parser)
+    parser.add_argument(
+        "--prediction-mode",
+        choices=PREDICTION_MODES,
+        default=None,
+        help="delayed_100hz uses four-sample frames and predicts the preceding frame; inherited time spans are preserved.",
+    )
+    parser.add_argument(
+        "--prediction-delay-frames", type=int, choices=(0, 1), default=None
+    )
+    parser.add_argument(
+        "--signal-quality-puls-flat-window-frames", type=int, default=None
+    )
+    parser.add_argument(
+        "--signal-quality-puls-median-window-frames", type=int, default=None
+    )

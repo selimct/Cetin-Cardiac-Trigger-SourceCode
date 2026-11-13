@@ -35,10 +35,17 @@ def trim_to_full_pulse_blocks(
     Returns:
         pd.DataFrame: trimmed df.
     """
+    if factor <= 0:
+        raise ValueError("factor must be positive")
+
     p = df[puls_col].to_numpy()
     n = len(p)
     if n < factor:
-        return df.iloc[0:0].copy()
+        temp = df.iloc[0:0].copy().reset_index(drop=True)
+        temp["raw_idx"] = temp.index
+        if fix_time:
+            temp["time_ms"] = np.array([], dtype=np.float64)
+        return temp
 
     # special case: no pulse data, e.g. column is all zeros
     if np.all(p == p[0]):
@@ -128,16 +135,17 @@ def frame_df_400hz_to_50hz(
         pd.DataFrame: New df on 50Hz grid.
     """
 
-    df = trim_to_full_pulse_blocks(df, puls_col="puls_raw", factor=factor)
-
     if factor <= 0:
         raise ValueError("factor must be positive")
+
+    df = trim_to_full_pulse_blocks(df, puls_col="puls_raw", factor=factor)
 
     # detect whether puls is just dummy / constant data
     has_real_puls = True
     if "puls_raw" in df.columns:
         p = df["puls_raw"].to_numpy()
-        has_real_puls = not np.all(p == p[0])  # False if all entries are identical
+        if p.size:
+            has_real_puls = not np.all(p == p[0])  # False if all entries are identical
 
     # if puls is dummy, do not pass it through
     if not has_real_puls:
@@ -176,7 +184,13 @@ def frame_df_400hz_to_50hz(
         T = len(g)
         T50 = T // factor
         if T50 < 1:
-            return g.iloc[0:0].copy()  # empty with same columns
+            columns = [f"{c}_t{k}" for c in ecg_cols for k in range(factor)]
+            columns.extend(passthrough_50hz_cols)
+            columns.extend(target_cols)
+            if keep_block_index:
+                columns.append("raw_idx")
+            columns.append("frame_idx")
+            return pd.DataFrame(columns=columns)
 
         Ttrim = T50 * factor
         g = g.iloc[:Ttrim].copy()

@@ -208,7 +208,8 @@ DeploymentManifest load_deployment_manifest(
     const std::filesystem::path &path)
 {
     const auto values = read_values(path);
-    if (required(values, "schema") != kDeploymentManifestSchema)
+    const auto schema = required(values, "schema");
+    if (schema != kDeploymentManifestSchema && schema != "dkfz-live-deployment-v2")
     {
         throw std::runtime_error(
             "Unsupported deployment manifest schema: " +
@@ -217,7 +218,7 @@ DeploymentManifest load_deployment_manifest(
     const auto contract_version = parse_integer(
         required(values, "preprocessing_contract_version"),
         "preprocessing_contract_version");
-    if (contract_version != kPreprocessingContractVersion)
+    if (contract_version != kPreprocessingContractVersion && contract_version != 3)
     {
         throw std::runtime_error(
             "Unsupported preprocessing_contract_version=" +
@@ -226,6 +227,7 @@ DeploymentManifest load_deployment_manifest(
     }
 
     DeploymentManifest manifest;
+    manifest.preprocessing_contract_version = contract_version;
     manifest.source_path = std::filesystem::absolute(path);
     manifest.source_settings = values;
     manifest.model_name = required(values, "model_name");
@@ -253,6 +255,9 @@ DeploymentManifest load_deployment_manifest(
     manifest.window_size = parse_size(required(values, "window_size"), "window_size");
     manifest.input_dim = parse_size(required(values, "input_dim"), "input_dim");
     manifest.threshold = parse_double(required(values, "threshold"), "threshold");
+    manifest.recovery_head = parse_bool(optional(values, "recovery_head", "false"), "recovery_head");
+    const auto recovery = optional(values, "recovery_threshold");
+    if (!recovery.empty()) manifest.recovery_threshold = parse_double(recovery, "recovery_threshold");
     const auto manual = optional(values, "manual_threshold");
     const auto fp = optional(values, "fp_threshold");
     const auto der = optional(values, "der_threshold");
@@ -268,7 +273,12 @@ DeploymentManifest load_deployment_manifest(
         optional(values, "model_output_is_probability", "false"),
         "model_output_is_probability");
 
+    manifest.prediction_mode = optional(values, "prediction_mode", "current");
+    manifest.prediction_delay_frames = parse_integer(optional(values, "prediction_delay_frames", "0"), "prediction_delay_frames");
     auto &framer = manifest.framer;
+    framer.reset_on_discontinuity = manifest.prediction_delay_frames != 0;
+    framer.signal_quality_puls_flat_window_frames = parse_size(optional(values, "signal_quality_puls_flat_window_frames", "10"), "signal_quality_puls_flat_window_frames");
+    framer.signal_quality_puls_median_window_frames = parse_size(optional(values, "signal_quality_puls_median_window_frames", "200"), "signal_quality_puls_median_window_frames");
     framer.raw_hz = parse_double(required(values, "raw_hz"), "raw_hz");
     framer.frame_size_raw = parse_size(
         required(values, "frame_size_raw"), "frame_size_raw");
@@ -363,12 +373,29 @@ DeploymentManifest load_deployment_manifest(
         values, "sample_index_field", "raw_idx");
     manifest.sid_field = optional(values, "sid_field", "sid");
 
+    if (schema == kDeploymentManifestSchema && (manifest.prediction_delay_frames ||
+        manifest.framer.signal_quality_puls_flat_window_frames != 10 ||
+        manifest.framer.signal_quality_puls_median_window_frames != 200))
+        throw std::invalid_argument("This prediction/preprocessing contract requires deployment schema v2");
+    if (schema == "dkfz-live-deployment-v2") {
+        static_cast<void>(required(values, "prediction_mode"));
+        static_cast<void>(required(values, "prediction_delay_frames"));
+    }
     validate_deployment_manifest(manifest);
     return manifest;
 }
 
 void validate_deployment_manifest(const DeploymentManifest &manifest)
 {
+    const bool legacy_50hz = manifest.preprocessing_contract_version == 3 &&
+        manifest.prediction_mode == "current" && manifest.prediction_delay_frames == 0 &&
+        manifest.framer.raw_hz == 400.0 && manifest.framer.frame_size_raw == 8 &&
+        manifest.framer.signal_quality_puls_flat_window_frames == 10 &&
+        manifest.framer.signal_quality_puls_median_window_frames == 200;
+    if (manifest.preprocessing_contract_version != kPreprocessingContractVersion && !legacy_50hz)
+        throw std::invalid_argument(
+            "Unsupported preprocessing contract: legacy contract 3 requires a "
+            "current-frame 400 Hz/eight-sample model with default quality histories");
     if (manifest.model_name.empty())
     {
         throw std::invalid_argument("model_name may not be empty");
@@ -425,10 +452,23 @@ void validate_deployment_manifest(const DeploymentManifest &manifest)
     {
         throw std::invalid_argument("threshold must be in [0, 1]");
     }
+    if ((manifest.prediction_mode != "current" && manifest.prediction_mode != "delayed_100hz") ||
+        manifest.prediction_delay_frames != (manifest.prediction_mode == "delayed_100hz" ? 1 : 0))
+        throw std::invalid_argument("Invalid prediction mode/delay contract");
+    if (manifest.prediction_delay_frames && (manifest.framer.raw_hz != 400 ||
+        manifest.framer.frame_size_raw != 4 || manifest.window_size < 2 || manifest.recovery_head || manifest.recovery_threshold))
+        throw std::invalid_argument("delayed_100hz requires 400 Hz, four-sample frames, window >= 2 and one primary output");
+    if (manifest.framer.signal_quality_puls_flat_window_frames < 2 || manifest.framer.signal_quality_puls_median_window_frames < 2)
+        throw std::invalid_argument("Signal quality pulse history windows must be >= 2");
     if (manifest.holdoff_frames < 0)
     {
         throw std::invalid_argument("holdoff_frames may not be negative");
     }
+    if (manifest.recovery_head && manifest.window_size < 2)
+        throw std::invalid_argument("recovery_head requires window_size >= 2");
+    if (manifest.recovery_threshold &&
+        (!manifest.recovery_head || !(*manifest.recovery_threshold > 0.0 && *manifest.recovery_threshold <= 1.0)))
+        throw std::invalid_argument("recovery_threshold requires recovery_head and a value in (0, 1]");
     if (manifest.framer.raw_hz <= 0.0 || manifest.framer.frame_size_raw == 0)
     {
         throw std::invalid_argument("raw_hz and frame_size_raw must be positive");

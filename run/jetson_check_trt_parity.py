@@ -117,6 +117,7 @@ def main() -> int:
                 path,
                 modelname=args.modelname,
                 model_dir=args.model_dir,
+                model_variant=args.model_variant,
                 label=label,
             )
         if not args.allow_engine_outside_model_dir:
@@ -124,6 +125,7 @@ def main() -> int:
                 engine_path,
                 modelname=args.modelname,
                 model_dir=args.model_dir,
+                model_variant=args.model_variant,
                 label="TensorRT engine",
             )
     except ValueError as exc:
@@ -159,14 +161,23 @@ def main() -> int:
     torch_logits = torch_reference_logits(cfg, checkpoint, inputs)
 
     for index in range(args.warmup_samples):
-        engine.infer_logit(inputs[index % len(inputs)])
+        engine.infer_logits(inputs[index % len(inputs)])
 
-    trt_logits = np.empty(len(inputs), dtype=np.float32)
+    trt_logits = np.empty(
+        (len(inputs), 2) if cfg.get("recovery_head") else len(inputs), dtype=np.float32
+    )
     durations_ns = np.empty(len(inputs), dtype=np.int64)
     measurement_started_ns = time.perf_counter_ns()
     for index, window in enumerate(inputs):
         inference_started_ns = time.perf_counter_ns()
-        trt_logits[index] = engine.infer_logit(window)
+        values = engine.infer_logits(window).reshape(-1)
+        expected_outputs = 2 if cfg.get("recovery_head") else 1
+        if values.size != expected_outputs:
+            raise ValueError(
+                f"TensorRT engine returned {values.size} outputs; expected "
+                f"{expected_outputs} for recovery_head={bool(cfg.get('recovery_head'))}"
+            )
+        trt_logits[index] = values if cfg.get("recovery_head") else values[0]
         durations_ns[index] = time.perf_counter_ns() - inference_started_ns
     measurement_elapsed_ns = time.perf_counter_ns() - measurement_started_ns
 

@@ -62,8 +62,24 @@ struct ProbabilityOutputRecord
     std::int64_t end_sample_idx = 0;
     std::optional<double> time_ms;
     float model_output = 0.0F;
+    std::optional<float> recovery_probability;
+    bool recovery_emitted_now = false;
     float probability = 0.0F;
     bool trigger_emitted_now = false;
+    std::uint64_t processing_duration_ns = 0;
+    std::uint64_t preprocessing_ns = 0, window_assembly_ns = 0, inference_ns = 0, trigger_ns = 0;
+    std::uint64_t cpu_thread_ns = 0, sample_queue_wait_ns = 0;
+    std::uint64_t gpu_upload_ns = 0, gpu_compute_ns = 0, gpu_download_ns = 0;
+    bool cuda_graph = false;
+    std::uint64_t frame_end_to_completion_ns = 0;
+    std::uint64_t completed_monotonic_ns = 0;
+    std::uint64_t decoded_monotonic_ns = 0;
+    std::uint64_t backlog_samples = 0;
+    bool missed_deadline = false;
+    std::optional<std::int64_t> observed_frame_idx;
+    std::int64_t observed_start_sample_idx = 0;
+    std::int64_t observed_end_sample_idx = 0;
+    std::optional<double> observed_time_ms;
 };
 
 enum class RuntimeOutputRecordKind

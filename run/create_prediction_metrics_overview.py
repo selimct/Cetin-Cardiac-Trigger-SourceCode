@@ -229,6 +229,21 @@ def _metrics_row(
     }
 
 
+def system_sort_key(row: dict[str, Any]) -> tuple[bool, str, int, str]:
+    """Keep the baseline first and each recovery variant next to its base model."""
+    name = str(row["system"])
+    base, variant = name, 0
+    for suffix, rank in (
+        ("_frozen_recovery", 2),
+        ("_lopo_recovery", 3),
+        ("_recovery", 1),
+    ):
+        if name.endswith(suffix):
+            base, variant = name.removesuffix(suffix), rank
+            break
+    return row["system_type"] != "baseline", base, variant, name
+
+
 def input_rows(
     records: Iterable[dict[str, Any]],
     *,
@@ -236,7 +251,7 @@ def input_rows(
     include_outer_position_errors: bool = False,
 ) -> list[dict[str, Any]]:
     """Convert normalized input records to derived metric rows."""
-    return [
+    rows = [
         _metrics_row(
             record,
             scope="input",
@@ -247,6 +262,18 @@ def input_rows(
         )
         for record in records
     ]
+    input_order = {
+        name: index
+        for index, name in enumerate(dict.fromkeys(row["input"] for row in rows))
+    }
+    return sorted(
+        rows,
+        key=lambda row: (
+            -(row["main_frequency_hz"] or 0),
+            input_order[row["input"]],
+            *system_sort_key(row),
+        ),
+    )
 
 
 def pooled_rows(
@@ -287,8 +314,7 @@ def pooled_rows(
         rows,
         key=lambda row: (
             -(row["main_frequency_hz"] or 0),
-            row["system_type"] != "baseline",
-            row["system"],
+            *system_sort_key(row),
         ),
     )
 
@@ -298,11 +324,16 @@ def _percentage(value: float) -> str:
 
 
 def _format_table(
-    rows: Iterable[dict[str, Any]], *, include_outer_position_errors: bool = False
+    rows: Iterable[dict[str, Any]],
+    *,
+    include_outer_position_errors: bool = False,
+    include_type: bool = True,
 ) -> str:
     row_list = list(rows)
     header = (
-        f"{'system':<40} {'type':<9} {'inputs':>7} {'Exact Se':>10} {'Exact +P':>10} "
+        f"{'system':<40} "
+        + (f"{'type':<9} " if include_type else "")
+        + f"{'inputs':>7} {'Exact Se':>10} {'Exact +P':>10} "
         f"{'Exact DER':>10} {'Beat Se':>10} {'Beat +P':>10} {'Beat DER':>10} "
         f"{'TP':>8} {'PE':>8} "
         + (f"{'oPE':>8} " if include_outer_position_errors else "")
@@ -312,8 +343,9 @@ def _format_table(
     for row in row_list:
         coverage = f"{row['evaluated_input_files']}/{row['requested_input_files']}"
         lines.append(
-            f"{row['system']:<40} {row['system_type']:<9} {coverage:>7} "
-            f"{_percentage(row['exact_sensitivity']):>10} "
+            f"{row['system']:<40} "
+            + (f"{row['system_type']:<9} " if include_type else "")
+            + f"{coverage:>7} {_percentage(row['exact_sensitivity']):>10} "
             f"{_percentage(row['exact_positive_predictive_value']):>10} "
             f"{_percentage(row['unique_detection_error']):>10} "
             f"{_percentage(row['beat_sensitivity']):>10} "
@@ -337,14 +369,72 @@ def format_root_overview(
     requested_input_files: int,
     include_outer_position_errors: bool = False,
 ) -> str:
-    """Format per-input sections followed by one all-system pooled section."""
+    """Format only the pooled comparison and compact per-system totals."""
     if any(record.get("main_frequency_hz") is not None for record in records):
         return format_gradient_overview(
             records,
             requested_input_files=requested_input_files,
             include_outer_position_errors=include_outer_position_errors,
+            compact=True,
         )
+    pooled = pooled_rows(
+        records,
+        requested_input_files=requested_input_files,
+        include_outer_position_errors=include_outer_position_errors,
+    )
+    return (
+        "\n".join(
+            (
+                "Pooled over all input files",
+                "",
+                _format_table(
+                    pooled,
+                    include_outer_position_errors=include_outer_position_errors,
+                    include_type=False,
+                ),
+                "",
+                format_totals(pooled, scope="all input files", compact=True),
+            )
+        )
+        + "\n"
+    )
+
+
+def format_per_input_overview(
+    records: list[dict[str, Any]],
+    *,
+    requested_input_files: int,
+    include_outer_position_errors: bool = False,
+) -> str:
+    """Compare all systems separately for each input and gradient frequency."""
     lines = ["Prediction metrics by input"]
+    frequencies = sorted(
+        {record.get("main_frequency_hz") for record in records},
+        key=lambda value: -(value or 0),
+    )
+    for frequency in frequencies:
+        selected = [
+            record for record in records if record.get("main_frequency_hz") == frequency
+        ]
+        if frequency is not None:
+            lines.extend(("", f"Main frequency {frequency:g} Hz"))
+        lines.extend(
+            _format_input_sections(
+                selected,
+                requested_input_files=requested_input_files,
+                include_outer_position_errors=include_outer_position_errors,
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _format_input_sections(
+    records: list[dict[str, Any]],
+    *,
+    requested_input_files: int,
+    include_outer_position_errors: bool,
+) -> list[str]:
+    lines = []
     inputs = list(dict.fromkeys(str(record["input"]) for record in records))
     for input_path in inputs:
         selected = [record for record in records if record["input"] == input_path]
@@ -353,35 +443,20 @@ def format_root_overview(
             requested_input_files=requested_input_files,
             include_outer_position_errors=include_outer_position_errors,
         )
-        rows.sort(key=lambda row: (row["system_type"] != "baseline", row["system"]))
+        rows.sort(key=system_sort_key)
         lines.extend(
             (
                 "",
                 input_path,
                 "",
                 _format_table(
-                    rows, include_outer_position_errors=include_outer_position_errors
+                    rows,
+                    include_outer_position_errors=include_outer_position_errors,
+                    include_type=False,
                 ),
             )
         )
-    pooled = pooled_rows(
-        records,
-        requested_input_files=requested_input_files,
-        include_outer_position_errors=include_outer_position_errors,
-    )
-    lines.extend(
-        (
-            "",
-            "Pooled over all input files",
-            "",
-            _format_table(
-                pooled, include_outer_position_errors=include_outer_position_errors
-            ),
-            "",
-            format_totals(pooled, scope="all input files"),
-        )
-    )
-    return "\n".join(lines) + "\n"
+    return lines
 
 
 def format_model_overview(
@@ -441,6 +516,7 @@ def format_gradient_overview(
     requested_input_files: int,
     system: str | None = None,
     include_outer_position_errors: bool = False,
+    compact: bool = False,
 ) -> str:
     """One section per frequency, pooling recordings without pooling configurations."""
     title = "Prediction metrics by gradient configuration"
@@ -464,9 +540,10 @@ def format_gradient_overview(
                 _format_table(
                     selected,
                     include_outer_position_errors=include_outer_position_errors,
+                    include_type=not compact,
                 ),
                 "",
-                format_totals(selected, scope=label),
+                format_totals(selected, scope=label, compact=compact),
             )
         )
     return "\n".join(lines) + "\n"
@@ -497,6 +574,46 @@ def _write_csv_atomic(
     _write_text_atomic(path, buffer.getvalue())
 
 
+def per_input_text_path(overview_text_path: Path) -> Path:
+    stem = overview_text_path.stem.removesuffix("_overview")
+    return overview_text_path.with_name(f"{stem}_per_input{overview_text_path.suffix}")
+
+
+def write_root_overviews(
+    records: list[dict[str, Any]],
+    *,
+    overview_text_path: Path,
+    requested_input_files: int,
+    include_outer_position_errors: bool = False,
+) -> tuple[Path, Path]:
+    """Write separate pooled and per-input comparisons, each with a CSV peer."""
+    if requested_input_files <= 0:
+        raise ValueError("requested_input_files must be positive.")
+    per_input_path = per_input_text_path(overview_text_path)
+    for text_path, formatter, rows in (
+        (overview_text_path, format_root_overview, pooled_rows),
+        (per_input_path, format_per_input_overview, input_rows),
+    ):
+        _write_text_atomic(
+            text_path,
+            formatter(
+                records,
+                requested_input_files=requested_input_files,
+                include_outer_position_errors=include_outer_position_errors,
+            ),
+        )
+        _write_csv_atomic(
+            text_path.with_suffix(".csv"),
+            rows(
+                records,
+                requested_input_files=requested_input_files,
+                include_outer_position_errors=include_outer_position_errors,
+            ),
+            include_outer_position_errors=include_outer_position_errors,
+        )
+    return overview_text_path, overview_text_path.with_suffix(".csv")
+
+
 def write_prediction_overviews(
     records: list[dict[str, Any]],
     *,
@@ -505,27 +622,12 @@ def write_prediction_overviews(
     requested_input_files: int,
     include_outer_position_errors: bool = False,
 ) -> tuple[Path, Path, list[Path]]:
-    """Write root pooled comparison and per-model all-input overviews."""
-    if requested_input_files <= 0:
-        raise ValueError("requested_input_files must be positive.")
+    """Write pooled/per-input comparisons and per-model all-input overviews."""
     metrics_root.mkdir(parents=True, exist_ok=True)
-    overview_csv_path = overview_text_path.with_suffix(".csv")
-    pooled = pooled_rows(
+    _, overview_csv_path = write_root_overviews(
         records,
+        overview_text_path=overview_text_path,
         requested_input_files=requested_input_files,
-        include_outer_position_errors=include_outer_position_errors,
-    )
-    _write_text_atomic(
-        overview_text_path,
-        format_root_overview(
-            records,
-            requested_input_files=requested_input_files,
-            include_outer_position_errors=include_outer_position_errors,
-        ),
-    )
-    _write_csv_atomic(
-        overview_csv_path,
-        pooled,
         include_outer_position_errors=include_outer_position_errors,
     )
 
@@ -607,6 +709,8 @@ def main() -> int:
 
     print(f"Wrote {text_path}")
     print(f"Wrote {csv_path}")
+    print(f"Wrote {per_input_text_path(text_path)}")
+    print(f"Wrote {per_input_text_path(text_path).with_suffix('.csv')}")
     print(f"Wrote {len(model_paths) // 2} per-model all-input overview(s)")
     return 0
 

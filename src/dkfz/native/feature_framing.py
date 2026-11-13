@@ -130,6 +130,9 @@ class LiveFeatureFramer:
         align_to_puls_blocks: bool = True,
         verify_puls_constant_within_block: bool = False,
         puls_constant_tol: float = 1e-12,
+        signal_quality_puls_flat_window_frames: int = 10,
+        signal_quality_puls_median_window_frames: int = 200,
+        reset_on_discontinuity: bool = False,
     ):
         ecg_normalizer = ecg_normalizer or RollingPairNormQuantileNormalizer()
         puls_normalizer = puls_normalizer or RollingScalarQuantileNormalizer()
@@ -154,6 +157,13 @@ class LiveFeatureFramer:
 
         self._native = _live_core.NativeFeatureFramer(
             {
+                "signal_quality_puls_flat_window_frames": int(
+                    signal_quality_puls_flat_window_frames
+                ),
+                "signal_quality_puls_median_window_frames": int(
+                    signal_quality_puls_median_window_frames
+                ),
+                "reset_on_discontinuity": bool(reset_on_discontinuity),
                 "raw_hz": self.raw_hz,
                 "frame_size_raw": self.frame_size_raw,
                 "include_puls": self.include_puls,
@@ -286,9 +296,15 @@ def make_live_framer(
     puls_clip: bool = True,
     align_to_puls_blocks: bool = True,
     verify_puls_constant_within_block: bool = False,
+    signal_quality_puls_flat_window_frames: int = 10,
+    signal_quality_puls_median_window_frames: int = 200,
+    reset_on_discontinuity: bool = False,
 ) -> LiveFeatureFramer:
     """Construct the native framer with the existing Python API."""
     return LiveFeatureFramer(
+        signal_quality_puls_flat_window_frames=signal_quality_puls_flat_window_frames,
+        signal_quality_puls_median_window_frames=signal_quality_puls_median_window_frames,
+        reset_on_discontinuity=reset_on_discontinuity,
         raw_hz=raw_hz,
         frame_size_raw=frame_size_raw,
         include_puls=include_puls,

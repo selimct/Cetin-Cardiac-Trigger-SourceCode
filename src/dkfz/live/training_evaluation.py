@@ -31,7 +31,8 @@ from dkfz.live.threshold_analysis import (
 from dkfz.live.triggers import StreamingHoldoffLocalMaxTrigger, TriggerEvent
 from dkfz.core.dataset import SlidingWindowDataset
 from dkfz.core.network_helpers import ThresholdSelection
-from dkfz.live.event_matching import EXACT_TOLERANCE_FRAMES, METRICS_SCHEMA_VERSION
+from dkfz.live.event_matching import METRICS_SCHEMA_VERSION
+from dkfz.live.training_plots import training_plots_enabled
 
 
 def _extract_model_tensor(model_output: torch.Tensor | tuple | list) -> torch.Tensor:
@@ -64,11 +65,12 @@ def predict_validation_probabilities(
                 enabled=amp_enabled,
             ):
                 logits = _extract_model_tensor(model(x)).reshape(batch_size, -1)
-            if logits.shape[1] != 1:
+            if logits.shape[1] not in (1, 2):
                 raise ValueError(
                     f"Expected one logit per sample, got logits.shape={tuple(logits.shape)}"
                 )
-            probs.append(torch.sigmoid(logits[:, 0].float()).cpu().numpy())
+            values = torch.sigmoid(logits.float()).cpu().numpy()
+            probs.append(values[:, 0] if values.shape[1] == 1 else values)
 
     if not probs:
         return np.asarray([], dtype=np.float32)
@@ -81,7 +83,22 @@ def validation_window_rows(dataset: SlidingWindowDataset) -> pd.DataFrame:
     end_indices = [
         int(start) + int(dataset.window_size) - 1 for start in dataset.starts
     ]
-    return data.iloc[end_indices].reset_index(drop=True).copy()
+    delay = int(getattr(dataset, "prediction_delay_frames", 0))
+    rows = (
+        data.iloc[[index - delay for index in end_indices]]
+        .reset_index(drop=True)
+        .copy()
+    )
+    if delay:
+        observed = data.iloc[end_indices].reset_index(drop=True)
+        rows["prediction_delay_frames"] = delay
+        rows["observed_frame_idx"] = observed["frame_idx"].to_numpy()
+        rows["observed_raw_idx"] = observed["raw_idx"].to_numpy()
+        rows["observed_raw_frame_end_idx"] = observed["raw_idx"].to_numpy() + 3
+        rows["raw_frame_end_idx"] = rows["raw_idx"] + 3
+        if "time_ms" in observed:
+            rows["observed_time_ms"] = observed["time_ms"].to_numpy()
+    return rows
 
 
 def _frame_end_sample_idx(row: pd.Series, frame_size_raw: int) -> int:
@@ -107,6 +124,7 @@ def build_live_eval_outputs(
     target_col: str,
     device: torch.device,
     use_amp: bool,
+    recovery_threshold: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build prediction-log and event-log DataFrames for validation windows.
 
@@ -128,7 +146,11 @@ def build_live_eval_outputs(
     if target_col not in log_df.columns:
         raise KeyError(f"Validation rows are missing target column {target_col!r}.")
 
-    log_df["prob"] = probs
+    dual = probs.ndim == 2
+    log_df["prob"] = probs[:, 0] if dual else probs
+    if dual:
+        log_df["recovery_prob"] = probs[:, 1]
+        log_df["recovery_emitted_now"] = False
     log_df["pred"] = 0
     log_df["trigger_emitted_now"] = False
     log_df["feature_dim"] = len(feature_cols)
@@ -138,28 +160,55 @@ def build_live_eval_outputs(
         trigger = StreamingHoldoffLocalMaxTrigger(
             threshold=float(threshold),
             holdoff_frames=int(holdoff_frames),
+            recovery_threshold=recovery_threshold,
         )
         last_row = None
         for idx, row in group.iterrows():
             last_row = row
             event = trigger.update(
                 probability=float(row["prob"]),
-                current_frame_idx_50hz=int(row["frame_idx"]),
-                current_sample_idx_400hz=_frame_end_sample_idx(row, frame_size_raw),
-                current_time_ms=_frame_time_ms(row),
+                current_frame_idx_50hz=int(
+                    row.get("observed_frame_idx", row["frame_idx"])
+                ),
+                current_sample_idx_400hz=(
+                    int(row["observed_raw_frame_end_idx"])
+                    if "observed_raw_frame_end_idx" in row
+                    else _frame_end_sample_idx(row, frame_size_raw)
+                ),
+                current_time_ms=row.get("observed_time_ms", _frame_time_ms(row)),
                 sid=sid,
+                recovery_probability=float(row["recovery_prob"]) if dual else None,
+                **(
+                    dict(
+                        target_frame_idx=int(row["frame_idx"]),
+                        target_sample_idx=_frame_end_sample_idx(row, frame_size_raw),
+                        target_time_ms=_frame_time_ms(row),
+                    )
+                    if dataset.prediction_delay_frames
+                    else {}
+                ),
             )
             if event is not None:
                 events.append(event)
                 log_df.loc[idx, "trigger_emitted_now"] = True
+                if dual:
+                    log_df.loc[idx, "recovery_emitted_now"] = (
+                        trigger.last_event_was_recovery
+                    )
 
         if last_row is not None:
             final_event = trigger.flush(
-                current_frame_idx_50hz=int(last_row["frame_idx"]),
-                current_sample_idx_400hz=_frame_end_sample_idx(
-                    last_row, frame_size_raw
+                current_frame_idx_50hz=int(
+                    last_row.get("observed_frame_idx", last_row["frame_idx"])
                 ),
-                current_time_ms=_frame_time_ms(last_row),
+                current_sample_idx_400hz=(
+                    int(last_row["observed_raw_frame_end_idx"])
+                    if "observed_raw_frame_end_idx" in last_row
+                    else _frame_end_sample_idx(last_row, frame_size_raw)
+                ),
+                current_time_ms=last_row.get(
+                    "observed_time_ms", _frame_time_ms(last_row)
+                ),
                 sid=sid,
             )
             if final_event is not None:
@@ -191,9 +240,12 @@ def write_live_eval_artifacts(
     metrics_dir: Path | None = None,
     metrics_prefix: str | None = None,
     threshold_selection: ThresholdSelection | None = None,
-    outer_error_association_frames: int = 2,
+    outer_error_association_frames: int | None = None,
+    exact_tolerance_frames: int | None = None,
+    plots: bool | None = None,
 ) -> None:
     """Write validation artifacts with the same shape as live prediction outputs."""
+    plots_enabled = training_plots_enabled(plots)
     prefix = prefix or "train"
     metrics_prefix = metrics_prefix or prefix
     metrics_dir = (
@@ -217,9 +269,25 @@ def write_live_eval_artifacts(
 
     metrics = {
         "metrics_schema_version": METRICS_SCHEMA_VERSION,
+        "plots_enabled": plots_enabled,
+        "num_threshold_error_plots": 0,
         "threshold": float(threshold),
+        **(
+            {"recovery_threshold": threshold_selection.recovery_threshold}
+            if threshold_selection is not None and "recovery_prob" in prediction_df
+            else {}
+        ),
+        "prediction_delay_frames": (
+            int(prediction_df.prediction_delay_frames.iloc[0])
+            if "prediction_delay_frames" in prediction_df and len(prediction_df)
+            else 0
+        ),
         "holdoff_frames": int(holdoff_frames),
-        "exact_tolerance_frames": EXACT_TOLERANCE_FRAMES,
+        "exact_tolerance_frames": (
+            int(threshold_selection.metrics.get("exact_tolerance_frames", 0))
+            if threshold_selection is not None
+            else 0
+        ),
         "error_association_frames": int(error_association_frames),
         "num_all_event_rows": int(len(prediction_df)),
         "num_trigger_event_rows": int(len(events_df)),
@@ -254,21 +322,30 @@ def write_live_eval_artifacts(
         target_col=target_col,
         error_association_frames=int(error_association_frames),
         outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
         threshold=float(threshold),
         events_df=events_df,
     )
     metrics["event_position"] = prediction_metrics["event_position"]
+    metrics["exact_tolerance_frames"] = prediction_metrics["event_position"][
+        "exact_tolerance_frames"
+    ]
+    metrics["outer_error_association_frames"] = prediction_metrics["event_position"][
+        "outer_error_association_frames"
+    ]
     metrics["emission_timing"] = prediction_metrics.get("emission_timing")
     report_text = format_prediction_metrics_report(prediction_metrics)
 
-    if threshold_selection is not None:
+    if threshold_selection is not None and plots_enabled:
         classified_events = classify_validation_events(
             prediction_df,
             threshold=float(threshold),
             target_col=target_col,
             holdoff_frames=int(holdoff_frames),
             error_association_frames=int(error_association_frames),
+            recovery_threshold=threshold_selection.recovery_threshold,
             outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
         )
         write_threshold_dashboard(
             threshold_dashboard_path,
@@ -283,6 +360,7 @@ def write_live_eval_artifacts(
             target_col=target_col,
             max_plots=DEFAULT_ERROR_PLOTS,
             window_frames=DEFAULT_ERROR_WINDOW_FRAMES,
+            recovery_threshold=threshold_selection.recovery_threshold,
         )
         metrics.update(
             {
@@ -306,6 +384,7 @@ def write_live_eval_artifacts(
         print(
             "Wrote threshold search to " f"{repo_relative_path(threshold_search_path)}"
         )
+    if threshold_selection is not None and plots_enabled:
         print(
             "Wrote threshold dashboard to "
             f"{repo_relative_path(threshold_dashboard_path)}"

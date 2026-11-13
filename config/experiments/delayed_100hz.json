@@ -1,0 +1,23 @@
+{
+  "modelname": "target_r_delayed_100hz",
+  "prediction_mode": "delayed_100hz",
+  "prediction_delay_frames": 1,
+  "raw_hz": 400.0,
+  "frame_size_raw": 4,
+  "window_size": 100,
+  "hidden_dim": 64,
+  "num_layers": 2,
+  "min_distance": 20,
+  "metrics_schema_version": 4,
+  "exact_tolerance_frames": 1,
+  "error_association_frames": 3,
+  "outer_error_association_frames": 5,
+  "puls_norm_window_frames": 1000,
+  "signal_quality_puls_flat_window_frames": 20,
+  "signal_quality_puls_median_window_frames": 400,
+  "signal_quality_mode": "none",
+  "recovery_head": false,
+  "recovery_only": false,
+  "save_prepped": true,
+  "use_prepped": false
+}

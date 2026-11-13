@@ -14,7 +14,7 @@ usage() {
     cat <<'USAGE'
 Usage: bash run/build_native.sh [options]
 
-Configure and incrementally build the native UART inference runtime.
+Configure and incrementally build the shipped runtime, parity and capture tools.
 
 Options:
   --tensorrt MODE   TensorRT mode: auto, on, or off. Default: auto.
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --test)
-            echo "Skipping development tests; they are not bundled in the public distribution." >&2
+            echo "Development tests are not bundled in the public distribution." >&2
             shift
             ;;
         --help|-h)
@@ -78,4 +78,7 @@ cmake \
 cmake --build "${build_dir}" --parallel
 
 printf 'TensorRT build mode: %s\n' "${tensorrt_mode}"
+printf 'Built %s\n' "${build_dir}/uart/uart_receiver_stream"
+printf 'Built %s\n' "${build_dir}/inference/native_live_runtime"
 printf 'Built %s\n' "${build_dir}/inference/native_uart_live_runtime"
+printf 'Built %s\n' "${build_dir}/inference/native_live_recovery_control"

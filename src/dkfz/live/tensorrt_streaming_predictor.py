@@ -6,13 +6,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 
 from dkfz.live.feature_framing import LiveFeatureFramer
 from dkfz.live.io import require_raw_signal_columns
 from dkfz.live.streaming_predictor import LiveStreamingPredictor
-from dkfz.live.tensorrt_engine import TensorRTLogitEngine
+
+if TYPE_CHECKING:
+    from dkfz.live.tensorrt_engine import TensorRTLogitEngine
 
 
 def _sigmoid(x: float) -> float:
@@ -59,6 +63,15 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
 
     def _run_model_on_current_window(self) -> float:
         window = np.stack(self._feature_window, axis=0).astype(np.float32)
+        if self.recovery_head:
+            values = np.asarray(self.engine.infer_logits(window)).reshape(-1)
+            if values.size != 2:
+                raise ValueError("A recovery model must output two logits")
+            probs = (
+                values if self.model_output_is_probability else _sigmoid_array(values)
+            )
+            self.last_recovery_probability = float(probs[1])
+            return float(probs[0])
         logit = self.engine.infer_logit(window)
         if self.model_output_is_probability:
             return float(logit)
@@ -70,6 +83,8 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
         batch_size: int,
     ) -> np.ndarray:
         """Run TensorRT over all sliding windows in feature order."""
+        if int(batch_size) < 1:
+            raise ValueError("batch_size must be positive")
         features = np.asarray(features, dtype=np.float32)
         if features.ndim != 2:
             raise ValueError(f"features must be 2D, got shape {features.shape}.")
@@ -84,11 +99,20 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
             writeable=False,
         )
 
-        logits = np.empty(num_windows, dtype=np.float32)
+        logits = np.empty(
+            (num_windows, 2) if self.recovery_head else num_windows, dtype=np.float32
+        )
         for start in range(0, num_windows, int(batch_size)):
             end = min(start + int(batch_size), num_windows)
             batch = np.ascontiguousarray(windows[start:end], dtype=np.float32)
-            logits[start:end] = self.engine.infer_logits(batch)
+            output = np.asarray(self.engine.infer_logits(batch), dtype=np.float32)
+            expected = (end - start, 2) if self.recovery_head else (end - start,)
+            if output.shape != expected:
+                raise ValueError(
+                    f"Engine output shape {output.shape} does not match expected {expected} "
+                    f"for recovery_head={self.recovery_head}"
+                )
+            logits[start:end] = output
 
         if self.model_output_is_probability:
             return logits
@@ -115,6 +139,21 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
         streaming path, but amortizes TensorRT launch/copy overhead across many
         offline windows.
         """
+        if int(batch_size) < 1:
+            raise ValueError("batch_size must be positive")
+        if self.prediction_delay_frames:
+            return self.run_dataframe(
+                df,
+                ecg1_col=ecg1_col,
+                ecg2_col=ecg2_col,
+                ecg3_col=ecg3_col,
+                puls_col=puls_col,
+                time_col=time_col,
+                time_unit=time_unit,
+                idx_col=idx_col,
+                sid_col=sid_col,
+                raw_idx_col=raw_idx_col,
+            )
         batch_size = int(batch_size)
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -128,7 +167,9 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
             include_puls=puls_col is not None,
         )
 
-        grouped = df.groupby(sid_col, sort=False) if sid_col in df.columns else [(0, df)]
+        grouped = (
+            df.groupby(sid_col, sort=False) if sid_col in df.columns else [(0, df)]
+        )
         all_events = []
         logs: list[pd.DataFrame] = []
 
@@ -161,11 +202,7 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
             frames = []
             ecg1 = group[ecg1_col].to_numpy(dtype=float)
             ecg2 = group[ecg2_col].to_numpy(dtype=float)
-            ecg3 = (
-                None
-                if ecg3_col is None
-                else group[ecg3_col].to_numpy(dtype=float)
-            )
+            ecg3 = None if ecg3_col is None else group[ecg3_col].to_numpy(dtype=float)
             for i in range(len(group)):
                 frame = self.framer.process_sample(
                     ecg1=float(ecg1[i]),
@@ -189,7 +226,9 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
             probabilities = self._infer_probabilities_batched(features, batch_size)
             rows = []
 
-            for prob_idx, probability in enumerate(probabilities):
+            for prob_idx, values in enumerate(probabilities):
+                probability = float(values[0]) if self.recovery_head else float(values)
+                recovery_probability = float(values[1]) if self.recovery_head else None
                 frame = frames[prob_idx + self.window_size - 1]
                 event = self.trigger_logic.update(
                     probability=float(probability),
@@ -197,6 +236,7 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
                     current_sample_idx_400hz=frame.end_sample_idx_400hz,
                     current_time_ms=frame.end_time_ms,
                     sid=sid,
+                    recovery_probability=recovery_probability,
                 )
                 if event is not None:
                     all_events.append(event)
@@ -217,6 +257,11 @@ class LiveTensorRTPredictor(LiveStreamingPredictor):
                         for col, val in zip(self.framer.feature_cols, frame.features)
                     }
                 )
+                if self.recovery_head:
+                    row["recovery_prob"] = recovery_probability
+                    row["recovery_emitted_now"] = (
+                        self.trigger_logic.last_event_was_recovery
+                    )
                 rows.append(row)
 
             final_event = self.flush(sid=sid)

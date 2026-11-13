@@ -1,10 +1,18 @@
 <!--
 # Copyright (c) 2026 Furkan Selim Cetin <mail@furkancetin.dev>
+
+For a transferred delayed 100 Hz model, use the [isolated Jetson preparation
+workflow](jetson-model-deployment.md) with `--prepare-only` and real recordings
+before considering activation. Legacy 50 Hz models remain supported.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Developed at the German Cancer Research Center (DKFZ).
 -->
 
 # Terminal alternatives
+
+The optional [100 Hz previous-frame model](100hz-delayed-target.md) uses these
+same preparation commands with a separately trained checkpoint/config pair.
+Its guide covers raw-time comparison and sustained latency telemetry.
 
 Use the [Trigger GUI workflow](README.md) for deployment and everyday operation.
 This file collects the corresponding terminal procedures for troubleshooting
@@ -66,7 +74,46 @@ Start the service only after validation and the
 [hardware checks](hardware.md#verify-the-installation) pass. Always keep the
 selected model name and exact source directory consistent.
 
+## Change startup recovery on the same model
+
+Stop the service and any direct runtime before either preparation command. For a
+published two-output model whose artifacts are already present, current-only is:
+
+```bash
+sudo systemctl stop dkfz-native-uart-live.service
+./prepare_model.sh ecg3_recovery --model-dir finished_models/ecg3/recovery \
+    --jetson-only --no-recovery
+```
+
+To return to the same model's saved recovery policy, stop again and run the same
+command without `--no-recovery`. A null calibrated threshold or
+`recovery_enabled=false` still leaves recovery disabled. Both modes preserve the
+two-output architecture and source configuration. Do not change `recovery_head`.
+Validate with the command above before restarting the service. This is the same
+workflow as **Startup recovery → Deploy and start** in the GUI; it does not
+require live switching or a recovery installation. Preparation retains its
+existing Python/parity requirements. Use the complete preparation path if the
+ONNX artifact is not present.
+
+## Validate models on the Jetson before rollout
+
+Use the [isolated Jetson preparation workflow](jetson-model-deployment.md)
+with `--prepare-only` and representative real recordings. It exports the model,
+builds a target-specific TensorRT engine and checks numerical and native-stream
+parity without replacing the active deployment. Repeat for every model and
+startup recovery policy you intend to use. Inspect `validation_report.json`;
+recordings without emitted events do not establish positive trigger coverage.
+
+For sustained service-profile and fixed-weight accuracy checks on a delayed
+100 Hz primary model, follow [model qualification](model-qualification.md).
+Physical UART/GPIO timing requires the separate hardware checks. The public
+distribution does not bundle the development regression suites.
+
 ## Link the service unit
+
+Review and qualify the [worker scheduling profile](service-latency.md) before
+installing the current template. Linking/reloading is a separate deployment
+step performed by the operator after qualification.
 
 GUI equivalent: **Installed service → Install / repair unit link**.
 Complete the [host provisioning](hardware.md#install-the-service) first.
@@ -107,7 +154,7 @@ alone is a healthy waiting state; it does not require restarting the service.
 
 ## Change the live threshold
 
-GUI equivalent: [Live thresholds](README.md#adjust-the-detection-threshold),
+GUI equivalent: [Detector controls](README.md#adjust-the-detection-threshold),
 which also provides calibrated presets, automatic restoration, and readback.
 For direct file control, change only `manual_threshold` in
 `deploy/model/model.conf` and save by atomic replacement:

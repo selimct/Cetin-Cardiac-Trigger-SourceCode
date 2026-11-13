@@ -135,10 +135,14 @@ _PREDICTION_CONFIG_SECTIONS = (
     (
         "Runtime",
         (
+            "prediction_mode",
+            "prediction_delay_frames",
+            "exact_tolerance_frames",
+            "error_association_frames",
+            "outer_error_association_frames",
             "threshold",
             "holdoff_frames",
             "holdoff_ms",
-            "error_association_frames",
             "skip_metrics",
             "include_input_name_in_outputs",
         ),
@@ -328,9 +332,7 @@ def resolve_prediction_inputs(
         ]
         if explicit_outputs:
             joined = ", ".join(explicit_outputs)
-            raise ValueError(
-                f"{joined} can only be used with one resolved input file."
-            )
+            raise ValueError(f"{joined} can only be used with one resolved input file.")
     return input_paths, multiple_inputs
 
 

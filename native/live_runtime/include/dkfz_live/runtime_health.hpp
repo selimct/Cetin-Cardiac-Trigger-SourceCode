@@ -26,6 +26,8 @@ struct RuntimeHealth
     std::atomic<std::uint64_t> last_inference_completed_ns{0};
     std::atomic<std::uint64_t> last_inference_duration_ns{0};
     std::atomic<std::uint64_t> max_inference_duration_ns{0};
+    std::atomic<std::uint64_t> missed_frame_deadlines{0};
+    std::atomic<std::uint64_t> max_frame_end_to_completion_ns{0};
     std::atomic<std::uint64_t> bytes_read{0};
     std::atomic<std::uint64_t> samples_decoded{0};
     std::atomic<std::uint64_t> samples_consumed{0};

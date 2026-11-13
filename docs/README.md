@@ -20,6 +20,7 @@ on the desktop to deploy models and operate the Jetson over SSH.
 - **Using an existing model:** continue below.
 - **Building your own model:** follow [Training](training.md).
 - **Operating without the GUI:** see [Terminal alternatives](terminal.md).
+- **Optional 100 Hz model:** see [previous-frame prediction](100hz-delayed-target.md).
 
 Examples use `my_model_cv`, produced by
 the [LOPO training workflow](training.md) with base name `my_model`. Replace the
@@ -43,10 +44,8 @@ live_stack/
 │   └── live/                Annotated dataset repository, grouped by patient
 ├── models/                  Training outputs, configurations, and predictions
 ├── notebooks/               Exploration and analysis
-├── tests/                   Python tests; C++ tests are under native/tests/
 ├── build_native/            Generated native executables
-├── docs_rework/             User guides and terminal alternatives
-└── docs/                    Earlier documentation and thesis references
+└── docs/                    User guides and terminal alternatives
 ```
 
 The main distinction is between a **source model directory**, such as
@@ -68,7 +67,11 @@ engine and model configuration are generated during deployment.
 Install the desktop application from the
 [GUI repository](https://github.com/selimct/DKFZ-MRI-Cardiac-Trigger-GUI), whose
 README covers installation and SSH setup. The desktop needs the GUI; the Jetson
-needs this project's checkout and the configured Python/native environment.
+uses this project's existing native stack over SSH. There is no GUI agent,
+recovery add-on, package upload, or extra service to install on the Jetson.
+Native operation and the GUI's discovery/status reads need no target Python.
+Model preparation still uses the existing Python export/parity environment;
+see [Prepare and deploy a model](#prepare-and-deploy-a-model).
 
 In the GUI's **Connection** dialog, enter the Jetson host, user, port, and SSH
 identity. Set **Remote project root** to the Jetson checkout, for example
@@ -77,8 +80,11 @@ connection, use the option to trust and save a new host key after verifying the
 host. Service actions also require remote sudo access; the dialog accepts a
 temporary sudo password when needed.
 
-Checks are manual. After changing connection or model settings, select
-**Check availability** again; changing a field alone sends no request.
+Checks are manual. Select **Check**, **Refresh models**, or a detector refresh
+button, or press Enter in the operation tabs to update information. Changing a
+field alone sends no request. Applying a detector setting or starting the
+service does not schedule a refresh; press Check or Enter when you want readback.
+The GUI does not poll the Jetson on a timer.
 
 ## Prepare and deploy a model
 
@@ -105,10 +111,26 @@ This builds the engine on the target Jetson and activates the matching files in
 training dependencies, including compatible PyTorch. Resolve any reported error
 before starting the new model.
 
-Models kept directly under `finished_models/` also appear through **Refresh
-models** and the **Finished models** selector on **Installed service**. For
-those selections, **Re-export weights + activate** runs the complete pipeline.
-Selecting a model alone does not activate it.
+Published families and their `recovery/` and `delayed_100hz/` variants under
+`finished_models/` appear through **Refresh models**
+and the **Finished models** selector on **Installed service**. For these models:
+
+1. Select the model and choose **Startup recovery**: **Use saved recovery settings**
+   or **Recovery off — current output only**.
+2. Confirm the hardware configuration and select **Deploy and start**. The GUI
+   checks availability, stops the service, prepares the selected model, validates
+   it, and starts it using the existing SSH commands.
+3. Press **Check** or Enter to refresh detector information afterward.
+
+You can use the same two-output model in either mode. Current-only preparation
+passes `--no-recovery`; saved settings omit that flag. Saved settings respect
+`recovery_enabled=false` and a null calibration threshold, so they do not force
+recovery on. Both model outputs and the source calibration stay intact; never
+set `recovery_head=false` to turn recovery off. Selecting a model or editing the
+startup choice alone does not change the deployment.
+
+The individual Stop, preparation, validation, and Start actions remain available.
+**Re-export weights + activate** runs the complete preparation pipeline.
 
 The [terminal reference](terminal.md#prepare-and-deploy-a-model) includes the
 alternative workflow that exports ONNX on the workstation first.
@@ -133,7 +155,7 @@ pulse timing is checked separately during hardware setup.
 A lower threshold generally admits weaker peaks; a higher one generally rejects
 more of them. Check both missed detections and extra triggers after a change.
 
-Open **Live thresholds** and select **Refresh deployed thresholds** to load the
+Open **Detector controls** and select **Refresh deployed thresholds** to load the
 active model's settings. Enter a value between 0 and 1 and select **Apply
 custom**, or choose **Use Weighted DER** or **Use Historical FP-first** when
 those calibrated presets are available. These explicit choices are saved as
@@ -149,6 +171,33 @@ trigger: strong peaks can emit earlier on the falling edge, while weaker peaks
 still wait for the selected detection threshold. It changes trigger timing;
 check the confirmed policy and timing after changing it.
 
+### Choose recovery behavior
+
+Use **Startup recovery** and **Deploy and start** as described above to run the
+same two-output model with its saved recovery policy or with only the current
+output. This workflow also works when the deployed stack has no live recovery
+interface.
+
+When already built into this stack, the native
+`build_native/inference/native_live_recovery_control` command provides optional
+live recovery changes for the running managed service. **Refresh recovery state**
+checks its response and fresh diagnostics for the deployed engine and service
+invocation. Direct sessions and older runtimes have no confirmed live switching;
+the GUI keeps those actions unavailable and uses the startup workflow instead.
+
+A live Apply saves a request. Refresh explicitly to confirm application at a
+completed frame; paused input may leave it pending. Recovery-only changes
+preserve primary settings, signal history, and existing holdoff. The live request
+belongs to the current service invocation. Restart uses the deployed manifest
+again; use current-only preparation for recovery-off startup across restarts.
+The source calibration and manifest are never rewritten by the live helper.
+
+The helper is a short-lived native command built with the normal runtime,
+including a runtime-only incremental rebuild. It runs only when explicitly
+called over SSH; it adds no daemon, GUI polling job, Python dependency, or
+installation step. Existing runtime supervision observes its separate policy
+file outside the inference thread; scalar models skip recovery-file checks.
+
 ### Reset or replace the model
 
 On **Installed service**, use **Restart** between patients or after lead changes
@@ -161,9 +210,9 @@ that does not match those checks still requires an explicit restart.
 
 | Change | Action |
 | --- | --- |
-| Threshold or early emission | Use **Live thresholds**, then refresh and confirm application. |
+| Threshold or early emission | Use **Detector controls**, then refresh and confirm application. |
 | UART, GPIO, or other runtime configuration | Edit `config/native_uart_live.conf`, then use **Restart**. |
-| Model weights or preprocessing | Stop, prepare and activate the matching model, check, then start. |
+| Model weights, preprocessing, or startup recovery | Use **Deploy and start**, or Stop, prepare, validate, and Start. |
 | Service unit | After editing it, use **Reload unit**, check availability, then restart. |
 
 ## Use a model on a recording
@@ -181,6 +230,10 @@ Predictions and trigger events are written under the source model directory's
 evaluation reports are written under its `metrics/` folder too. Use a patient
 excluded from training when measuring performance on new patients.
 
+Before rolling out an updated model or runtime, use the
+[isolated Jetson preparation checks](terminal.md#validate-models-on-the-jetson-before-rollout)
+while triggering is stopped. Development regression suites are maintained upstream.
+
 ## If something goes wrong
 
 | Symptom | First check |
@@ -189,5 +242,5 @@ excluded from training when measuring performance on new patients.
 | No decoded samples | Check wiring, UART selection, pinmux, and competing serial processes. |
 | Inference is paused | Check patient/lead connections and signal validity; recovery needs fresh input. |
 | Events appear but no physical pulse | Check GPIO mapping, line ownership, polarity, and the receiving device. |
-| Threshold change has no effect | Refresh **Live thresholds** and inspect request status and the confirmed policy. |
+| Threshold change has no effect | Refresh **Detector controls** and inspect request status and the confirmed policy. |
 

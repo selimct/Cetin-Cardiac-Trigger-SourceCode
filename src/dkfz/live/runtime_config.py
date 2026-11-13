@@ -10,17 +10,16 @@ from pathlib import Path
 
 import numpy as np
 
-from dkfz.live.feature_framing import (
-    PREPROCESSING_CONTRACT_VERSION,
-    make_live_framer,
-)
+from dkfz.live.feature_framing import make_live_framer
 from dkfz.live.io import load_json_config
+from dkfz.live.prediction_contract import (
+    prediction_delay, PREDICTION_CONFIG_KEYS, supported_preprocessing_contract,
+)
 from dkfz.live.model_variants import (
     DEFAULT_MODEL_VARIANT,
     default_config_path,
     default_trt_engine_path as default_variant_trt_engine_path,
 )
-
 
 BASE_RUNTIME_DEFAULTS = {
     "modelname": "target_r",
@@ -65,7 +64,10 @@ TORCH_RUNTIME_REQUIRED_KEYS = COMMON_RUNTIME_REQUIRED_KEYS | {
     "num_layers",
 }
 
-COMMON_RUNTIME_OPTIONAL_KEYS = {
+COMMON_RUNTIME_OPTIONAL_KEYS = PREDICTION_CONFIG_KEYS | {
+    "recovery_head",
+    "recovery_enabled",
+    "recovery_threshold",
     "feature_cols",
     "holdoff_frames",
     "holdoff_ms",
@@ -87,6 +89,13 @@ RUNTIME_COLUMN_KEYS = (
     "sid_col",
     "raw_idx_col",
 )
+
+
+def effective_recovery_threshold(settings: dict, *, disable_recovery: bool = False):
+    """Disable recovery events while preserving the two-output architecture."""
+    if disable_recovery or not settings.get("recovery_enabled", True):
+        return None
+    return settings.get("recovery_threshold")
 
 
 def default_train_config_path(
@@ -155,19 +164,12 @@ def load_runtime_settings(
             settings[key] = values[key]
 
     settings["config"] = str(cfg_path)
+    settings["recovery_threshold"] = effective_recovery_threshold(settings)
     settings["verify_puls_constant_within_block"] = bool(
         settings.get("verify_puls_constant_within_block", False)
     )
-    contract_version = settings.get("preprocessing_contract_version")
-    if (
-        contract_version is not None
-        and int(contract_version) != PREPROCESSING_CONTRACT_VERSION
-    ):
-        raise ValueError(
-            "Runtime config preprocessing_contract_version="
-            f"{contract_version} is incompatible with supported version "
-            f"{PREPROCESSING_CONTRACT_VERSION}."
-        )
+    supported_preprocessing_contract(settings)
+    prediction_delay(settings)
     return settings
 
 
@@ -180,12 +182,14 @@ def holdoff_frames_from_settings(settings: dict) -> int:
     raw_hz = float(settings["raw_hz"])
     frame_size_raw = int(settings["frame_size_raw"])
     frame_hz = raw_hz / frame_size_raw
-    holdoff_ms = float(settings.get("holdoff_ms", 180.0))
+    holdoff_ms = float(settings.get("holdoff_ms", 200.0))
     return int(np.ceil(holdoff_ms * frame_hz / 1000.0))
 
 
 def make_checked_runtime_framer(settings: dict):
     """Build the shared live framer and validate it against input_dim."""
+    supported_preprocessing_contract(settings)
+    delay = prediction_delay(settings)
     raw_hz = float(settings["raw_hz"])
     frame_size_raw = int(settings["frame_size_raw"])
     include_puls = not bool(settings["not_use_puls"])
@@ -198,6 +202,13 @@ def make_checked_runtime_framer(settings: dict):
         )
 
     framer = make_live_framer(
+        reset_on_discontinuity=bool(delay),
+        signal_quality_puls_flat_window_frames=int(
+            settings.get("signal_quality_puls_flat_window_frames", 10)
+        ),
+        signal_quality_puls_median_window_frames=int(
+            settings.get("signal_quality_puls_median_window_frames", 200)
+        ),
         raw_hz=raw_hz,
         frame_size_raw=frame_size_raw,
         include_puls=include_puls,

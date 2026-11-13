@@ -82,6 +82,9 @@ SignalQualityStats signal_quality_stats_from_python(const py::object &value)
 FeatureFramerConfig feature_config_from_python(const py::dict &values)
 {
     FeatureFramerConfig config;
+    config.signal_quality_puls_flat_window_frames = value_or<std::size_t>(values, "signal_quality_puls_flat_window_frames", 10);
+    config.signal_quality_puls_median_window_frames = value_or<std::size_t>(values, "signal_quality_puls_median_window_frames", 200);
+    config.reset_on_discontinuity = value_or<bool>(values, "reset_on_discontinuity", false);
     config.raw_hz = value_or<double>(values, "raw_hz", config.raw_hz);
     config.frame_size_raw = value_or<std::size_t>(
         values,
@@ -268,7 +271,7 @@ std::optional<std::vector<T>> optional_array_values(
 PYBIND11_MODULE(_live_core, module)
 {
     module.doc() = "Canonical native live preprocessing and trigger core.";
-    module.attr("PREPROCESSING_CONTRACT_VERSION") = 3;
+    module.attr("PREPROCESSING_CONTRACT_VERSION") = kPreprocessingContractVersion;
 
     py::class_<FeatureFrame>(module, "NativeFeatureFrame")
         .def_property_readonly("frame_idx_50hz", [](const FeatureFrame &value)
@@ -628,6 +631,9 @@ PYBIND11_MODULE(_live_core, module)
             py::arg("threshold"),
             py::arg("holdoff_frames"))
         .def("reset", &StreamingTriggerDetector::reset)
+        .def("set_recovery_threshold", &StreamingTriggerDetector::set_recovery_threshold)
+        .def("set_thresholds", &StreamingTriggerDetector::set_thresholds)
+        .def_property_readonly("last_event_was_recovery", &StreamingTriggerDetector::last_event_was_recovery)
         .def(
             "update",
             [](StreamingTriggerDetector &detector,
@@ -635,20 +641,36 @@ PYBIND11_MODULE(_live_core, module)
                std::int64_t frame_idx,
                std::int64_t sample_idx,
                const py::object &time_ms,
-               const py::object &sid)
+               const py::object &sid,
+               const py::object &recovery_probability,
+               const py::object &target_frame_idx,
+               const py::object &target_sample_idx,
+               const py::object &target_time_ms)
             {
+                std::optional<TriggerPosition> target;
+                if (!target_frame_idx.is_none() || !target_sample_idx.is_none()) {
+                    if (target_frame_idx.is_none() || target_sample_idx.is_none())
+                        throw std::invalid_argument("Both target indices must be supplied");
+                    target = TriggerPosition{target_frame_idx.cast<std::int64_t>(),
+                        target_sample_idx.cast<std::int64_t>(), optional_double(target_time_ms)};
+                }
                 return detector.update(
                     probability,
                     frame_idx,
                     sample_idx,
                     optional_double(time_ms),
-                    sid_as_string(sid));
+                    sid_as_string(sid),
+                    optional_double(recovery_probability), target);
             },
             py::arg("probability"),
             py::arg("current_frame_idx_50hz"),
             py::arg("current_sample_idx_400hz"),
             py::arg("current_time_ms"),
-            py::arg("sid") = 0)
+            py::arg("sid") = 0,
+            py::arg("recovery_probability") = py::none(),
+            py::arg("target_frame_idx") = py::none(),
+            py::arg("target_sample_idx") = py::none(),
+            py::arg("target_time_ms") = py::none())
         .def(
             "flush",
             [](StreamingTriggerDetector &detector,
@@ -716,4 +738,34 @@ PYBIND11_MODULE(_live_core, module)
         py::arg("threshold"),
         py::arg("holdoff_frames") = 0,
         py::arg("frame_offset") = 0);
+
+    module.def(
+        "streaming_trigger_peaks_with_recovery",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> probabilities,
+           py::array_t<float, py::array::c_style | py::array::forcecast> recovery,
+           double threshold, std::optional<double> recovery_threshold,
+           std::int64_t holdoff_frames, std::optional<double> emission_threshold)
+        {
+            if (probabilities.ndim() != 1 || recovery.ndim() != 1 || probabilities.size() != recovery.size())
+                throw std::invalid_argument("primary and recovery probabilities must be equal-length vectors");
+            const auto p = probabilities.unchecked<1>();
+            const auto r = recovery.unchecked<1>();
+            StreamingTriggerDetector detector(threshold, holdoff_frames);
+            detector.set_recovery_threshold(recovery_threshold);
+            detector.set_thresholds(threshold, emission_threshold.value_or(threshold));
+            std::vector<std::int64_t> peaks;
+            for (py::ssize_t i = 0; i < p.shape(0); ++i)
+            {
+                auto event = detector.update(p(i), i, i, std::nullopt, "0", r(i));
+                if (event) peaks.push_back(event->peak_frame_idx);
+            }
+            if (p.shape(0))
+            {
+                auto event = detector.flush(p.shape(0)-1, p.shape(0)-1, std::nullopt);
+                if (event) peaks.push_back(event->peak_frame_idx);
+            }
+            return peaks;
+        }, py::arg("probabilities"), py::arg("recovery_probabilities"),
+        py::arg("threshold"), py::arg("recovery_threshold"), py::arg("holdoff_frames") = 10,
+        py::arg("emission_threshold") = py::none());
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 import os
+import json
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,7 @@ def _reset_raw_segment(
     split: str,
     time_col: str | None,
     sid_col: str = "sid",
+    preserve_gaps: bool = False,
 ) -> pd.DataFrame:
     """Make a raw segment look like a fresh online stream."""
     segment = df.copy().reset_index(drop=True)
@@ -77,7 +79,12 @@ def _reset_raw_segment(
 
     for idx_col in ("raw_idx", "idx"):
         if idx_col in segment.columns:
-            segment[idx_col] = np.arange(len(segment), dtype=np.int64)
+            if preserve_gaps and len(segment):
+                segment[idx_col] = segment[idx_col].to_numpy(dtype=np.int64) - int(
+                    segment[idx_col].iloc[0]
+                )
+            else:
+                segment[idx_col] = np.arange(len(segment), dtype=np.int64)
 
     if time_col is not None and time_col in segment.columns and not segment.empty:
         values = pd.to_numeric(segment[time_col], errors="coerce")
@@ -197,6 +204,9 @@ def _build_training_frame_dfs_for_path(
     signal_quality_mode: str,
     signal_quality_stats: dict | None,
     split: str | None,
+    prediction_delay_frames: int = 0,
+    signal_quality_puls_flat_window_frames: int = 10,
+    signal_quality_puls_median_window_frames: int = 200,
 ) -> tuple[list[pd.DataFrame], str]:
     """Build framed rows for one raw parquet file."""
     out: list[pd.DataFrame] = []
@@ -228,6 +238,9 @@ def _build_training_frame_dfs_for_path(
         raise KeyError(f"{path}: missing target column {target_col!r}")
 
     framer = make_live_framer(
+        reset_on_discontinuity=bool(prediction_delay_frames),
+        signal_quality_puls_flat_window_frames=signal_quality_puls_flat_window_frames,
+        signal_quality_puls_median_window_frames=signal_quality_puls_median_window_frames,
         raw_hz=raw_hz,
         frame_size_raw=frame_size_raw,
         include_puls=include_puls,
@@ -286,6 +299,7 @@ def _build_training_frame_dfs_for_path(
                 sid=next_segment_sid,
                 split=split_name,
                 time_col=time_col,
+                preserve_gaps=bool(prediction_delay_frames),
             )
             next_segment_sid += 1
             frame_df = make_live_feature_dataframe(
@@ -356,6 +370,9 @@ def build_training_frame_dfs(
     signal_quality_stats: dict | None = None,
     prep_workers: int = 1,
     split: str | None = None,
+    prediction_delay_frames: int = 0,
+    signal_quality_puls_flat_window_frames: int = 10,
+    signal_quality_puls_median_window_frames: int = 200,
 ) -> list[pd.DataFrame]:
     """Build framed rows with either an assigned or within-file split.
 
@@ -397,6 +414,9 @@ def build_training_frame_dfs(
         "ecg_slope_slow_window_samples": ecg_slope_slow_window_samples,
         "signal_quality_mode": signal_quality_mode,
         "signal_quality_stats": signal_quality_stats,
+        "prediction_delay_frames": prediction_delay_frames,
+        "signal_quality_puls_flat_window_frames": signal_quality_puls_flat_window_frames,
+        "signal_quality_puls_median_window_frames": signal_quality_puls_median_window_frames,
         "split": split,
     }
 
@@ -437,6 +457,7 @@ def default_prepped_file(modelname: str) -> str:
 def save_prepped_training_frame_dfs(
     frame_dfs: list[pd.DataFrame],
     out_file: str,
+    settings: dict | None = None,
 ) -> None:
     """Save preprocessed training frame DataFrames as one parquet file."""
     if not frame_dfs:
@@ -446,11 +467,17 @@ def save_prepped_training_frame_dfs(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = pd.concat(frame_dfs, ignore_index=True)
     output[PREPROCESSING_CONTRACT_COL] = PREPROCESSING_CONTRACT_VERSION
+    if settings is not None:
+        output["_preprocessing_settings"] = json.dumps(
+            preprocessing_cache_settings(settings), sort_keys=True
+        )
     output.to_parquet(out_path, compression="snappy")
     print(f"Wrote preprocessed training frames to {repo_relative_path(out_path)}")
 
 
-def load_prepped_training_frame_dfs(in_file: str) -> list[pd.DataFrame]:
+def load_prepped_training_frame_dfs(
+    in_file: str, settings: dict | None = None
+) -> list[pd.DataFrame]:
     """Load a regenerated preprocessed training-frame parquet."""
     in_path = Path(in_file)
     if not in_path.exists():
@@ -459,15 +486,35 @@ def load_prepped_training_frame_dfs(in_file: str) -> list[pd.DataFrame]:
         )
 
     df = pd.read_parquet(in_path)
+    marker = "_preprocessing_settings"
+    if settings is not None:
+        expected = preprocessing_cache_settings(settings)
+        if marker not in df:
+            if settings.get("prediction_delay_frames", 0):
+                raise ValueError(
+                    "Delayed model cache has no preprocessing settings fingerprint; regenerate it"
+                )
+        else:
+            values = df[marker].dropna().unique()
+            if len(values) != 1 or json.loads(values[0]) != expected:
+                raise ValueError(
+                    "Preprocessed cache settings differ from requested framing/history/target mode; regenerate it"
+                )
+    if marker in df:
+        df = df.drop(columns=[marker])
     if PREPROCESSING_CONTRACT_COL not in df.columns:
         raise ValueError(
             f"{repo_relative_path(in_path)} has no preprocessing contract marker. "
             "Regenerate it from raw parquet input data."
         )
-    contract_values = pd.to_numeric(
-        df[PREPROCESSING_CONTRACT_COL],
-        errors="coerce",
-    ).dropna().unique()
+    contract_values = (
+        pd.to_numeric(
+            df[PREPROCESSING_CONTRACT_COL],
+            errors="coerce",
+        )
+        .dropna()
+        .unique()
+    )
     if (
         len(contract_values) != 1
         or int(contract_values[0]) != PREPROCESSING_CONTRACT_VERSION
@@ -523,3 +570,41 @@ def separate_framed_train_val(
         )
 
     return train_df, val_df
+
+
+def preprocessing_cache_settings(settings: dict) -> dict:
+    from dkfz.live.training_config import TRAINING_DEFAULTS
+
+    keys = (
+        "prediction_mode",
+        "prediction_delay_frames",
+        "raw_hz",
+        "frame_size_raw",
+        "ecg1_col",
+        "ecg2_col",
+        "ecg3_col",
+        "puls_col",
+        "not_use_puls",
+        "target_col",
+        "target_reduce",
+        "ecg_quantile",
+        "ecg_norm_window_samples",
+        "ecg1_offset",
+        "ecg2_offset",
+        "ecg3_offset",
+        "ecg_rotation_angle",
+        "ecg_slope_mode",
+        "ecg_slope_slow_window_samples",
+        "signal_quality_mode",
+        "signal_quality_puls_flat_window_frames",
+        "signal_quality_puls_median_window_frames",
+        "puls_offset",
+        "puls_quantile_low",
+        "puls_quantile_high",
+        "puls_norm_window_frames",
+        "puls_norm_warmup_value",
+        "puls_clip",
+        "align_to_puls_blocks",
+        "verify_puls_constant_within_block",
+    )
+    return {key: settings.get(key, TRAINING_DEFAULTS[key]) for key in keys}

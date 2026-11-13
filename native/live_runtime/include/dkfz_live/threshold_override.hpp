@@ -37,3 +37,27 @@ class ThresholdOverrideReader
 };
 
 } // namespace dkfz::live
+
+namespace dkfz::live
+{
+struct RecoveryOverrideUpdate
+{
+    bool changed = false;
+    std::optional<double> threshold;
+    std::uint64_t request_id = 0;
+    std::string error;
+};
+
+// Separate identity/invocation-bound override: primary writers never touch it.
+class RecoveryOverrideReader
+{
+  public:
+    RecoveryOverrideReader(std::filesystem::path path, DeploymentManifest manifest,
+                           std::string invocation);
+    RecoveryOverrideUpdate poll();
+  private:
+    std::filesystem::path path_;
+    DeploymentManifest manifest_;
+    std::string invocation_, last_state_;
+};
+}

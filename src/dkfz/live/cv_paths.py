@@ -14,7 +14,12 @@ from dkfz.live.io import REPO_ROOT
 CV_MODEL_SUFFIX = "_cv"
 NESTED_LOPO_DIRNAME = "nested_lopo"
 NESTED_LOPO_HPO_DIRNAME = "nested_lopo_hpo"
-_CV_METHOD_DIRNAMES = {NESTED_LOPO_DIRNAME, NESTED_LOPO_HPO_DIRNAME}
+NESTED_RECOVERY_LOPO_DIRNAME = "nested_recovery_lopo"
+_CV_METHOD_DIRNAMES = {
+    NESTED_LOPO_DIRNAME,
+    NESTED_LOPO_HPO_DIRNAME,
+    NESTED_RECOVERY_LOPO_DIRNAME,
+}
 
 
 def cv_modelname(modelname: str) -> str:
@@ -81,6 +86,7 @@ __all__ = [
     "CV_MODEL_SUFFIX",
     "NESTED_LOPO_DIRNAME",
     "NESTED_LOPO_HPO_DIRNAME",
+    "NESTED_RECOVERY_LOPO_DIRNAME",
     "cv_base_modelname",
     "cv_modelname",
     "default_cv_output_dir",

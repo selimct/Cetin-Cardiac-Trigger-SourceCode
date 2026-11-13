@@ -19,9 +19,14 @@ def duration_minutes(timepoints: int, config: dict[str, Any]) -> float:
     return timepoints * frame_size / raw_hz / 60.0
 
 
-def format_totals(rows: Iterable[dict[str, Any]], *, scope: str) -> str:
+def format_totals(
+    rows: Iterable[dict[str, Any]], *, scope: str, compact: bool = False
+) -> str:
     """Format totals once per system, without counting shared data across models."""
     lines = [f"Totals over {scope} (per system)"]
+    if compact:
+        header = f"{'system':<40} {'annotated':>10} {'predicted':>10} {'minutes':>10}"
+        lines.extend(("", header, "-" * len(header)))
     for row in rows:
         minutes = row["duration_minutes"]
         duration = (
@@ -29,6 +34,12 @@ def format_totals(rows: Iterable[dict[str, Any]], *, scope: str) -> str:
             if minutes is None
             else f"{minutes:.2f}"
         )
+        if compact:
+            lines.append(
+                f"{row['system']:<40} {row['num_target_events']:>10} "
+                f"{row['num_predicted_events']:>10} {duration:>10}"
+            )
+            continue
         lines.extend(
             (
                 "",

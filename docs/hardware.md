@@ -30,8 +30,8 @@ ECG device.
 | GND, e.g. pin 6 | Common signal ground | — |
 
 These are **physical header pin numbers**. Linux device names, GPIO offsets, and
-line ownership must be verified on the installed JetPack image. The bundled
-[carrier-board specification](../docs/Jetson-Orin-Nano-DevKit-Carrier-Board-Specification_SP-11324-001_v1.3.pdf)
+line ownership must be verified on the installed JetPack image. The carrier-board
+specification, available from [NVIDIA's Jetson Download Center](https://developer.nvidia.com/embedded/downloads),
 provides the connector reference.
 
 The header uses 3.3 V logic. Connect a common ground and use a compatible
@@ -60,10 +60,11 @@ Adjust that path for another installation, then run:
 bash setup.sh --profile jetson
 ```
 
-Setup creates or reuses the selected environment and builds/tests the native
-runtime with TensorRT required. It preserves JetPack's system packages. The
-Jetson profile installs the base project dependencies; provision the additional
-PyTorch/training dependencies in that environment before preparing a model.
+Setup creates or reuses the selected environment, installs training/ONNX
+dependencies, and builds the native runtime with TensorRT required. It
+preserves JetPack's system packages. Ensure a JetPack-compatible PyTorch
+is available in that environment before preparing a model. Development
+test suites are maintained upstream.
 
 Review [`config/native_uart_live.conf`](../config/native_uart_live.conf).
 Confirm the UART device, trigger GPIO, polarity, and pulse timing for your
@@ -77,6 +78,10 @@ restart the service to use the rebuilt executable. The
 [terminal equivalent](terminal.md#rebuild-the-runtime) is kept separately.
 
 ## Install the service
+
+The source template now includes a [bounded worker scheduling
+profile](service-latency.md). Rebuild the runtime and qualify that profile before
+installing it. Installing and starting the service are separate operator actions.
 
 The service template runs as `dkfz-live` and reads the checkout through a
 read-only mount at `/opt/dkfz-live`. Before installing it:
@@ -152,4 +157,12 @@ The result is `output/session.parquet`, with centered raw-rate ECG and pulse
 columns. It can be inspected or used for offline prediction. Training also
 requires reviewed annotations. Pin-29 edge capture is a separate diagnostic
 tool; its configuration and script help cover that less common workflow.
+
+UART samples arrive in groups of three long packets followed by one short
+packet. Pulse and respiration values carried in a group become active on the
+first ECG sample of the following group and stay active until their next
+update. `puls_updated` marks that first sample. Native UART/GPIO readout and
+offline UART/GPIO conversion use this same boundary rule. Converted parquets
+record `auxiliary_publication=following-group` in their metadata; regenerate
+older UART-derived parquets from their captures to apply the corrected timing.
 

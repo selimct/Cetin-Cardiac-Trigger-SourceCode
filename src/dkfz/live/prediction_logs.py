@@ -133,12 +133,16 @@ def add_prediction_result_columns(
         log_df["pred"] = 0
 
     if not log_df.empty and events:
-        peak_keys = {(event.sid, event.peak_frame_idx_50hz) for event in events}
-        frame_idx_col = _frame_idx_column(log_df)
-        row_keys = list(zip(log_df["sid"], log_df[frame_idx_col]))
+        if "raw_frame_end_idx" in log_df:
+            peak_keys = {(event.sid, event.peak_sample_idx_400hz) for event in events}
+            row_keys = list(zip(log_df["sid"], log_df["raw_frame_end_idx"]))
+        else:
+            peak_keys = {(event.sid, event.peak_frame_idx_50hz) for event in events}
+            frame_idx_col = _frame_idx_column(log_df)
+            row_keys = list(zip(log_df["sid"], log_df[frame_idx_col]))
         log_df.loc[[key in peak_keys for key in row_keys], "pred"] = 1
 
-    cols_to_reduce: list[str] = ["target", "siemens_tr", "puls_peak"]#, "mhd_peak"]
+    cols_to_reduce: list[str] = ["target", "siemens_tr", "puls_peak"]  # , "mhd_peak"]
     for col in reduced_raw_cols or []:
         if col not in cols_to_reduce:
             cols_to_reduce.append(col)
@@ -178,9 +182,7 @@ def order_prediction_log_columns(
     ordered = [col for col in preferred if col in log_df.columns]
     ordered += [col for col in feature_cols if col in log_df.columns]
     ordered += [
-        col
-        for col in log_df.columns
-        if col not in ordered and not col.startswith("_")
+        col for col in log_df.columns if col not in ordered and not col.startswith("_")
     ]
     return log_df[ordered]
 

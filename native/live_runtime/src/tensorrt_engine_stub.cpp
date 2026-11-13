@@ -16,7 +16,8 @@ std::unique_ptr<LogitEngine> make_tensorrt_logit_engine(
     const std::string &,
     const std::string &,
     std::size_t,
-    std::size_t)
+    std::size_t,
+    bool)
 {
     throw std::runtime_error(
         "This executable was built without the TensorRT C++ and CUDA runtime "

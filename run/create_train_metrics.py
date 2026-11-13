@@ -25,7 +25,7 @@ from dkfz.live.event_matching import METRICS_SCHEMA_VERSION  # noqa: E402
 from dkfz.live.io import repo_relative_path  # noqa: E402
 from dkfz.live.metrics_overview import duration_minutes, format_totals  # noqa: E402
 
-CV_METHODS = ("nested_lopo", "nested_lopo_hpo")
+CV_METHODS = ("nested_lopo", "nested_lopo_hpo", "nested_recovery_lopo")
 CONFIGURATION_KEYS = (
     "input_dim",
     "hidden_dim",
@@ -37,6 +37,8 @@ CONFIGURATION_KEYS = (
     "ecg3_col",
     "ecg_slope_mode",
     "signal_quality_mode",
+    "recovery_head",
+    "recovery_max_fp_increase",
 )
 
 
@@ -195,10 +197,10 @@ def build_training_record(run: TrainingRun) -> dict[str, Any]:
     schema_version = int(
         _required_number(event, "metrics_schema_version", run.summary_path)
     )
-    if schema_version not in {2, METRICS_SCHEMA_VERSION}:
+    if schema_version not in {2, 3, METRICS_SCHEMA_VERSION}:
         raise ValueError(
             f"{run.summary_path} uses metrics schema {schema_version}; "
-            f"expected 2 or {METRICS_SCHEMA_VERSION}"
+            f"expected 2, 3 or {METRICS_SCHEMA_VERSION}"
         )
     macro = _required_object(summary, "macro_patient_metrics", run.summary_path)
     best_model = _required_object(summary, "best_model", run.summary_path)
@@ -279,6 +281,10 @@ def build_training_record(run: TrainingRun) -> dict[str, Any]:
     return {
         "modelname": run.modelname,
         "cv_method": run.cv_method,
+        "evaluation_scope": summary.get(
+            "evaluation_scope", "full_detector_patient_holdout"
+        ),
+        "base_patient_holdout_verified": summary.get("base_patient_holdout_verified"),
         "metrics_schema_version": schema_version,
         "num_patients": int(
             _required_number(summary, "num_patients", run.summary_path)
@@ -292,6 +298,10 @@ def build_training_record(run: TrainingRun) -> dict[str, Any]:
         "deployment_threshold": threshold,
         "fp_threshold": config.get("fp_threshold", selection.get("fp_threshold")),
         "der_threshold": config.get("der_threshold", selection.get("der_threshold")),
+        "recovery_head": bool(config.get("recovery_head", False)),
+        "recovery_threshold": config.get("recovery_threshold"),
+        "recovery_max_fp_increase": config.get("recovery_max_fp_increase"),
+        "recovery_validation_metrics": config.get("recovery_validation_metrics"),
         "selection_best_attainable_exact_sensitivity": (
             None
             if selection_best_sensitivity is None
@@ -352,6 +362,9 @@ def _overview_row(record: dict[str, Any]) -> dict[str, Any]:
         "deployment_threshold": record["deployment_threshold"],
         "fp_threshold": record.get("fp_threshold"),
         "der_threshold": record.get("der_threshold"),
+        "recovery_head": record["recovery_head"],
+        "recovery_threshold": record["recovery_threshold"],
+        "recovery_max_fp_increase": record["recovery_max_fp_increase"],
         "outer_position_error": (
             event.get("outer_position_error")
             if record["metrics_schema_version"] >= 3
@@ -404,7 +417,7 @@ def _macro_percentage(metric: dict[str, float]) -> str:
 def format_text_overview(records: list[dict[str, Any]]) -> str:
     """Return a compact human-readable overview of normalized records."""
     header_format = (
-        "{:<34} {:<16} {:>4} {:>5} {:>6} {:>9} "
+        "{:<34} {:<16} {:>4} {:>5} {:>6} {:>9} {:>9} "
         "{:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>15} {:>15} {:>15} "
         "{:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}"
     )
@@ -416,6 +429,7 @@ def format_text_overview(records: list[dict[str, Any]]) -> str:
             "folds",
             "dep ep",
             "deploy th",
+            "recov th",
             "Exact Se",
             "Exact +P",
             "Exact DER",
@@ -440,6 +454,7 @@ def format_text_overview(records: list[dict[str, Any]]) -> str:
             "-----",
             "-----",
             "---------",
+            "---------",
             "-------",
             "-------",
             "--------",
@@ -462,6 +477,12 @@ def format_text_overview(records: list[dict[str, Any]]) -> str:
         event = record["_overview"]
         macro = record["macro_patient_metrics"]
         rates = record["error_rates"]
+        recovery_threshold = record["recovery_threshold"]
+        recovery_label = (
+            f"{recovery_threshold:.4f}"
+            if recovery_threshold is not None
+            else "disabled" if record["recovery_head"] else "off"
+        )
         lines.append(
             header_format.format(
                 record["modelname"],
@@ -470,6 +491,7 @@ def format_text_overview(records: list[dict[str, Any]]) -> str:
                 record["num_outer_folds"],
                 record["deployment_selected_epoch"],
                 f"{record['deployment_threshold']:.4f}",
+                recovery_label,
                 _percentage(event["exact_sensitivity"]),
                 _percentage(event["exact_positive_predictive_value"]),
                 _percentage(event["unique_detection_error"]),
@@ -498,6 +520,10 @@ def format_text_overview(records: list[dict[str, Any]]) -> str:
         for record in records
     ]
     lines.extend(("", format_totals(totals, scope="all held-out outer folds")))
+    if any(record["cv_method"] == "nested_recovery_lopo" for record in records):
+        lines.append(
+            "Recovery LOPO holds out patients from recovery-head training/selection; the frozen base may have seen them."
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -567,8 +593,8 @@ def main() -> int:
     parser.add_argument(
         "--cv-method",
         choices=(*CV_METHODS, "all"),
-        default="nested_lopo",
-        help="CV result type to aggregate. Defaults to nested_lopo.",
+        default="all",
+        help="CV result type to aggregate. Defaults to all, including recovery-head LOPO.",
     )
     parser.add_argument(
         "--model",

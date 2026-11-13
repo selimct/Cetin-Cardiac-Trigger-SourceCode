@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -164,12 +163,10 @@ class UartSampleExtractor:
         self.sample_rate_hz = float(sample_rate_hz)
         self.ecg1_offset, self.ecg2_offset, self.puls_offset = offsets
         self.stats = stats or UartByteConversionStats()
-        self.pending_pulses: deque[int] = deque()
+        self.pending_pulse: int | None = None
         self.current_pulse: int | None = None
-        self.pulse_samples_remaining = 0
-        self.pending_respirations: deque[int] = deque()
+        self.pending_respiration: int | None = None
         self.current_respiration: int | None = None
-        self.respiration_samples_remaining = 0
 
     @staticmethod
     def _ecg1(group: bytes, offset: int) -> int:
@@ -194,22 +191,6 @@ class UartSampleExtractor:
         trigger_frame_offset = EXT_FRAME_OFFSETS[sample_in_packet // 2]
         return group[trigger_frame_offset + EXT_BYTE_OFFSET] & 0x0F
 
-    def _select_pulse(self) -> bool:
-        if self.pulse_samples_remaining > 0:
-            return False
-        if self.pending_pulses:
-            self.current_pulse = self.pending_pulses.popleft()
-            self.pulse_samples_remaining = 8
-            return True
-        return False
-
-    def _select_respiration(self) -> None:
-        if self.respiration_samples_remaining > 0:
-            return
-        if self.pending_respirations:
-            self.current_respiration = self.pending_respirations.popleft()
-            self.respiration_samples_remaining = 8
-
     def rows_for_group(
         self,
         group: bytes,
@@ -223,17 +204,20 @@ class UartSampleExtractor:
 
         pr_sign = (group[12] >> 4) & 0x0F
         pulse_value = ((group[12] & 0x0F) << 8) | group[13]
-        if pr_sign == 1:
-            self.pending_pulses.append(pulse_value)
-        elif pr_sign == 2:
-            self.pending_respirations.append(pulse_value)
+        # Three long packets and one short packet form a group. Its auxiliary
+        # payload belongs to the following group, never to its own ECG rows.
+        puls_updated = self.pending_pulse is not None
+        if puls_updated:
+            self.current_pulse = self.pending_pulse
+        if self.pending_respiration is not None:
+            self.current_respiration = self.pending_respiration
+        self.pending_pulse = None
+        self.pending_respiration = None
 
         packet_index = self.stats.packets
         self.stats.packets += 1
         rows: list[dict[str, object]] = []
         for sample_in_packet, offset in enumerate(SAMPLE_OFFSETS):
-            puls_updated = self._select_pulse()
-            self._select_respiration()
             raw_idx = self.stats.samples
             ecg1_raw = subtract_offset_float64(
                 self._ecg1(group, offset),
@@ -266,17 +250,17 @@ class UartSampleExtractor:
                     "resp_raw": self.current_respiration,
                     "ext": self._ext(group, sample_in_packet),
                     "pr_sign": pr_sign,
-                    "puls_updated": puls_updated,
+                    "puls_updated": puls_updated and sample_in_packet == 0,
                     "source_packet": packet_index,
                     "sample_in_packet": sample_in_packet,
                     "capture_byte_offset": capture_byte_offset,
                 }
             )
             self.stats.samples += 1
-            if self.pulse_samples_remaining > 0:
-                self.pulse_samples_remaining -= 1
-            if self.respiration_samples_remaining > 0:
-                self.respiration_samples_remaining -= 1
+        if pr_sign == 1:
+            self.pending_pulse = pulse_value
+        elif pr_sign == 2:
+            self.pending_respiration = pulse_value
         return rows
 
 
@@ -355,6 +339,7 @@ def convert_uart_bytes_to_parquet(
             b"uart_ecg2_offset": str(float(ecg2_offset)).encode(),
             b"uart_puls_offset": str(float(puls_offset)).encode(),
             b"format": b"uart-pin10-samples-v1",
+            b"auxiliary_publication": b"following-group",
         },
     )
 

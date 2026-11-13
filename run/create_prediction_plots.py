@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from dkfz.live.io import repo_relative_path  # noqa: E402
+from dkfz.live.prediction_cache import read_prediction_frame  # noqa: E402
 from dkfz.live.threshold_analysis import (  # noqa: E402
     classify_validation_events,
     fixed_threshold_analysis,
@@ -52,19 +53,24 @@ def pack_prediction_sequences(
     if missing:
         raise KeyError(f"Prediction log is missing column(s): {', '.join(missing)}")
 
-    groups = (
-        df.groupby("sid", sort=False, dropna=False)
-        if "sid" in df.columns
-        else [(0, df)]
-    )
+    from dkfz.live.eval_metrics import independent_prediction_groups
+
+    groups = independent_prediction_groups(df)
     gap_len = int(max(holdoff_frames + 1, 2 * error_association_frames + 1, 20))
     probability_parts: list[np.ndarray] = []
     target_parts: list[np.ndarray] = []
     for _sid, group in groups:
+        values = group["prob"].to_numpy(dtype=np.float32)
+        if "recovery_prob" in group:
+            recovery = group["recovery_prob"].to_numpy(dtype=np.float32).copy()
+            recovery[0] = 0.0
+            values = np.column_stack((values, recovery))
         probability_parts.extend(
             (
-                group["prob"].to_numpy(dtype=np.float32),
-                np.zeros(gap_len, dtype=np.float32),
+                values,
+                np.zeros(
+                    (gap_len, 2) if values.ndim == 2 else gap_len, dtype=np.float32
+                ),
             )
         )
         target_parts.extend(
@@ -83,19 +89,38 @@ def prediction_analysis_settings(config: dict, metrics: dict) -> dict:
     threshold = metrics.get("threshold", config.get("threshold"))
     if threshold is None:
         raise ValueError("Prediction metrics and model config contain no threshold")
+    from dkfz.live.event_matching import event_tolerances
+
+    policy = event_tolerances(config)
+    recorded = metrics.get("event_position", {})
+    if (
+        int(recorded.get("metrics_schema_version", 0)) >= 4
+        or policy["exact_tolerance_frames"] == 0
+    ):
+        policy.update({k: int(recorded[k]) for k in policy if k in recorded})
     return {
+        **(
+            {
+                "recovery_threshold": metrics.get(
+                    "recovery_threshold",
+                    (
+                        config.get("recovery_threshold")
+                        if config.get("recovery_enabled", True)
+                        else None
+                    ),
+                )
+            }
+            if config.get("recovery_head")
+            else {}
+        ),
         "target_col": str(
             metrics.get("target_col") or config.get("target_col", "target")
         ),
         "threshold": float(threshold),
         "holdoff_frames": int(
-            config.get("holdoff_frames", config.get("min_distance", 20))
+            config.get("holdoff_frames", config.get("min_distance", 10))
         ),
-        "error_association_frames": int(
-            metrics.get("event_position", {}).get(
-                "error_association_frames", config.get("error_association_frames", 1)
-            )
-        ),
+        **policy,
         "sensitivity_efficiency": float(
             config.get("threshold_sensitivity_efficiency", 0.95)
         ),
@@ -129,7 +154,7 @@ def create_pooled_prediction_dashboard(
         settings = input_settings
         # Pack each file separately: sid values can repeat across recordings.
         probabilities, targets = pack_prediction_sequences(
-            pd.read_parquet(prediction_log),
+            read_prediction_frame(prediction_log),
             target_col=settings["target_col"],
             holdoff_frames=settings["holdoff_frames"],
             error_association_frames=settings["error_association_frames"],
@@ -174,7 +199,7 @@ def create_prediction_plots(
     """Write fixed-threshold analysis artifacts without changing model files."""
     config = json.loads(config_path.read_text(encoding="utf-8"))
     metrics = json.loads(metrics_json.read_text(encoding="utf-8"))
-    prediction_df = pd.read_parquet(prediction_log)
+    prediction_df = read_prediction_frame(prediction_log)
 
     settings = prediction_analysis_settings(config, metrics)
     target_col = settings["target_col"]
@@ -196,7 +221,10 @@ def create_prediction_plots(
         sensitivity_efficiency=sensitivity_efficiency,
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
+        exact_tolerance_frames=settings["exact_tolerance_frames"],
+        outer_error_association_frames=settings["outer_error_association_frames"],
         thresholds=threshold_grid(threshold_step, threshold),
+        recovery_threshold=settings.get("recovery_threshold"),
     )
     event_df = classify_validation_events(
         prediction_df,
@@ -204,6 +232,9 @@ def create_prediction_plots(
         target_col=target_col,
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
+        exact_tolerance_frames=settings["exact_tolerance_frames"],
+        outer_error_association_frames=settings["outer_error_association_frames"],
+        recovery_threshold=settings.get("recovery_threshold"),
     )
 
     for output_path in (dashboard_path, errors_path, events_path):
@@ -223,6 +254,7 @@ def create_prediction_plots(
         target_col=target_col,
         max_plots=max_error_plots,
         window_frames=error_window_frames,
+        recovery_threshold=settings.get("recovery_threshold"),
     )
 
 

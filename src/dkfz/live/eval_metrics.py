@@ -14,10 +14,8 @@ import numpy as np
 import pandas as pd
 
 from dkfz.live.event_matching import (
-    DEFAULT_ERROR_ASSOCIATION_FRAMES,
     EVENT_COUNT_KEYS,
     event_metrics_from_counts,
-    EXACT_TOLERANCE_FRAMES,
     METRICS_SCHEMA_VERSION,
     associate_event_positions,
     compute_event_position_metrics,
@@ -67,22 +65,30 @@ def _frame_positions(group: pd.DataFrame) -> np.ndarray:
     return np.arange(len(group), dtype=int)
 
 
-def _groups(df: pd.DataFrame):
-    return (
-        df.groupby("sid", sort=False, dropna=False)
-        if "sid" in df.columns
-        else [(0, df)]
-    )
+def independent_prediction_groups(df: pd.DataFrame):
+    """Keep restarted frame counters in independent matching namespaces."""
+    base = df.groupby("sid", sort=False, dropna=False) if "sid" in df else [(0, df)]
+    for sid, group in base:
+        if "frame_idx" in group and group.frame_idx.diff().le(0).any():
+            segments = group.frame_idx.diff().le(0).cumsum()
+            for _, segment in group.groupby(segments, sort=False):
+                yield sid, segment
+        else:
+            yield sid, group
 
 
 def metrics_from_event_counts(
     counts: Counter,
     error_association_frames: int,
     outer_error_association_frames: int = 2,
+    exact_tolerance_frames: int = 0,
 ) -> dict:
     """Recompute event totals and rates from summed TP/PE/oPE/FP/FN."""
     return event_metrics_from_counts(
-        counts, error_association_frames, outer_error_association_frames
+        counts,
+        error_association_frames,
+        outer_error_association_frames,
+        exact_tolerance_frames,
     )
 
 
@@ -91,15 +97,24 @@ def build_event_position_summary(
     *,
     pred_col: str = "pred",
     target_col: str = "target",
-    error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
+    error_association_frames: int | None = None,
     outer_error_association_frames: int | None = None,
+    exact_tolerance_frames: int | None = None,
 ) -> dict:
     """Return exact-frame event metrics grouped by independent sequence."""
     if pred_col not in df.columns or target_col not in df.columns:
         raise KeyError(f"Missing {pred_col!r} or {target_col!r} in prediction log.")
-    outer_error_association_frames = _outer_radius(df, outer_error_association_frames)
+    policy = frame_event_tolerances(
+        df,
+        error_association_frames=error_association_frames,
+        outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
+    )
+    error_association_frames = policy["error_association_frames"]
+    outer_error_association_frames = policy["outer_error_association_frames"]
+    exact_tolerance_frames = policy["exact_tolerance_frames"]
     counts: Counter = Counter()
-    for _sid, group in _groups(df):
+    for _sid, group in independent_prediction_groups(df):
         positions = _frame_positions(group)
         pred_mask = _coerce_binary(group[pred_col].to_numpy(), pred_col) == 1
         target_mask = _coerce_binary(group[target_col].to_numpy(), target_col) == 1
@@ -108,11 +123,15 @@ def build_event_position_summary(
             positions[target_mask],
             error_association_frames=error_association_frames,
             outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
         )
         for key in EVENT_COUNT_KEYS:
             counts[key] += int(metrics[key])
     return metrics_from_event_counts(
-        counts, int(error_association_frames), outer_error_association_frames
+        counts,
+        int(error_association_frames),
+        outer_error_association_frames,
+        exact_tolerance_frames,
     )
 
 
@@ -120,7 +139,7 @@ def _estimate_frame_period_ms(df: pd.DataFrame) -> float | None:
     if "frame_idx" not in df.columns or "time_ms" not in df.columns:
         return None
     estimates: list[float] = []
-    for _sid, group in _groups(df):
+    for _sid, group in independent_prediction_groups(df):
         frames = pd.to_numeric(group["frame_idx"], errors="coerce").to_numpy(float)
         times = pd.to_numeric(group["time_ms"], errors="coerce").to_numpy(float)
         frame_delta = np.diff(frames)
@@ -134,7 +153,40 @@ def _outer_radius(df, supplied):
     if supplied is not None:
         return int(supplied)
     period = _estimate_frame_period_ms(df)
+    if period is not None and np.isclose(period, 10.0):
+        return 5
     return 2 if period is None or period <= 0 else int(np.floor(40.0 / period + 1e-9))
+
+
+def frame_event_tolerances(
+    df,
+    *,
+    exact_tolerance_frames=None,
+    error_association_frames=None,
+    outer_error_association_frames=None,
+):
+    """Infer 100 Hz policy from saved timing; explicit current-policy radii win."""
+    period = _estimate_frame_period_ms(df)
+    hundred = period is not None and np.isclose(period, 10.0)
+    if "prediction_delay_frames" in df and len(df):
+        hundred |= bool(df.prediction_delay_frames.eq(1).any())
+    return dict(
+        exact_tolerance_frames=(
+            int(1 if hundred else 0)
+            if exact_tolerance_frames is None
+            else int(exact_tolerance_frames)
+        ),
+        error_association_frames=(
+            int(3 if hundred else 1)
+            if error_association_frames is None
+            else int(error_association_frames)
+        ),
+        outer_error_association_frames=(
+            (5 if hundred else _outer_radius(df, None))
+            if outer_error_association_frames is None
+            else int(outer_error_association_frames)
+        ),
+    )
 
 
 def build_emission_timing_summary(
@@ -142,34 +194,68 @@ def build_emission_timing_summary(
     events_df: pd.DataFrame,
     *,
     target_col: str,
-    error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
+    error_association_frames: int | None = None,
     outer_error_association_frames: int | None = None,
+    exact_tolerance_frames: int | None = None,
 ) -> dict:
     """Summarize emission offsets for peak events associated with target beats."""
     required = {"peak_frame_idx_50hz", "emitted_on_frame_idx_50hz"}
     missing = sorted(required - set(events_df.columns))
     if missing:
         raise KeyError(f"Trigger events are missing column(s): {', '.join(missing)}")
-    outer_error_association_frames = _outer_radius(
-        prediction_df, outer_error_association_frames
+    policy = frame_event_tolerances(
+        prediction_df,
+        error_association_frames=error_association_frames,
+        outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
     )
+    error_association_frames = policy["error_association_frames"]
+    outer_error_association_frames = policy["outer_error_association_frames"]
+    exact_tolerance_frames = policy["exact_tolerance_frames"]
     frame_period_ms = _estimate_frame_period_ms(prediction_df)
     offsets: Counter = Counter()
-    prediction_groups = {sid: group for sid, group in _groups(prediction_df)}
-    event_groups = {sid: group for sid, group in _groups(events_df)}
-    for sid, prediction_group in prediction_groups.items():
+    prediction_groups = list(independent_prediction_groups(prediction_df))
+    event_groups = {
+        sid: group for sid, group in independent_prediction_groups(events_df)
+    }
+    for sid, prediction_group in prediction_groups:
         target_positions = _frame_positions(prediction_group)[
             _coerce_binary(prediction_group[target_col].to_numpy(), target_col) == 1
         ]
         event_group = event_groups.get(sid)
         if event_group is None or event_group.empty:
             continue
+        if "raw_idx" in prediction_group and "peak_sample_idx_400hz" in event_group:
+            start = int(prediction_group.raw_idx.min())
+            end = int(
+                prediction_group.get(
+                    "raw_frame_end_idx",
+                    prediction_group.get(
+                        "_raw_frame_end_idx", prediction_group.raw_idx
+                    ),
+                ).max()
+            )
+            # Only filtering split namespaces is necessary. A delayed log saves
+            # exact frame ends; older current-frame logs may only save starts.
+            if sum(key == sid for key, _ in prediction_groups) > 1:
+                if (
+                    "raw_frame_end_idx" not in prediction_group
+                    and "_raw_frame_end_idx" not in prediction_group
+                ):
+                    steps = np.diff(prediction_group.raw_idx.to_numpy(dtype=int))
+                    end += (
+                        int(np.median(steps[steps > 0])) - 1 if (steps > 0).any() else 0
+                    )
+                event_group = event_group[
+                    event_group.peak_sample_idx_400hz.between(start, end)
+                ]
         peak_positions = event_group["peak_frame_idx_50hz"].to_numpy(dtype=int)
         association = associate_event_positions(
             peak_positions,
             target_positions,
             error_association_frames=error_association_frames,
             outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
         )
         for pred_idx, target_idx in (
             association.exact_matches
@@ -202,8 +288,9 @@ def build_prediction_metrics_report(
     prediction_df: pd.DataFrame,
     *,
     target_col: str,
-    error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
+    error_association_frames: int | None = None,
     outer_error_association_frames: int | None = None,
+    exact_tolerance_frames: int | None = None,
     pred_col: str = "pred",
     threshold: float | None = None,
     events_df: pd.DataFrame | None = None,
@@ -212,6 +299,7 @@ def build_prediction_metrics_report(
     report = {
         "metrics_schema_version": METRICS_SCHEMA_VERSION,
         "num_rows": int(len(prediction_df)),
+        "frame_period_ms": _estimate_frame_period_ms(prediction_df),
         "target_col": target_col,
         "pred_col": pred_col,
         "threshold": None if threshold is None else float(threshold),
@@ -221,6 +309,7 @@ def build_prediction_metrics_report(
             target_col=target_col,
             error_association_frames=error_association_frames,
             outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
         ),
     }
     if events_df is not None:
@@ -230,6 +319,7 @@ def build_prediction_metrics_report(
             target_col=target_col,
             error_association_frames=error_association_frames,
             outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
         )
     return report
 
@@ -238,8 +328,9 @@ def build_siemens_trigger_metrics_report(
     prediction_df: pd.DataFrame,
     *,
     target_col: str,
-    error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
+    error_association_frames: int | None = None,
     outer_error_association_frames: int | None = None,
+    exact_tolerance_frames: int | None = None,
     source_col: str = "siemens_tr",
 ) -> dict:
     """Return exact-frame metrics for Siemens first-marker trigger events."""
@@ -260,6 +351,7 @@ def build_siemens_trigger_metrics_report(
         pred_col=pred_col,
         error_association_frames=error_association_frames,
         outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
     )
     report["pred_col"] = source_col
     report["pred_positive_value"] = 1
@@ -295,8 +387,9 @@ def format_prediction_metrics_report(metrics: dict) -> str:
         f"{'Setting':<28} Value",
         f"{'-' * 27} {'-' * 28}",
         f"{'Threshold':<28} {'-' if threshold is None else f'{float(threshold):.6f}'}",
-        f"{'Exact-match tolerance':<28} {event['exact_tolerance_frames']} frames",
+        f"{('TP tolerance' if event['exact_tolerance_frames'] else 'Exact-match tolerance'):<28} {event['exact_tolerance_frames']} frames",
         f"{'Error-association window':<28} ±{event['error_association_frames']} frame",
+        f"{'Outer-association window':<28} ±{event['outer_error_association_frames']} frames",
         f"{'Classification position':<28} Probability peak frame",
         f"{'Emission position':<28} Informational only",
         "",
@@ -304,7 +397,7 @@ def format_prediction_metrics_report(metrics: dict) -> str:
         "-----------------------",
         f"{'Category':<32} {'Count':>8}",
         f"{'-' * 32} {'-' * 8}",
-        f"{'Exact true positives':<32} {event['exact_true_positive']:8,d}",
+        f"{('True positives (within tolerance)' if event['exact_tolerance_frames'] else 'Exact true positives'):<32} {event['exact_true_positive']:8,d}",
         f"{'Position errors':<32} {event['position_error']:8,d}",
         f"{'  Early position errors':<32} {event['position_error_early']:8,d}",
         f"{'  Late position errors':<32} {event['position_error_late']:8,d}",
@@ -313,7 +406,11 @@ def format_prediction_metrics_report(metrics: dict) -> str:
         f"{'Unmatched false positives':<32} {event['unmatched_false_positive']:8,d}",
         f"{'Unmatched false negatives':<32} {event['unmatched_false_negative']:8,d}",
         "",
-        "Exact-frame metrics",
+        (
+            "TP metrics (configured tolerance)"
+            if event["exact_tolerance_frames"]
+            else "Exact-frame metrics"
+        ),
         "-------------------",
         f"{'Metric':<9} {'Formula':<39} {'Result':>8}",
         f"{'-' * 9} {'-' * 39} {'-' * 8}",
@@ -350,9 +447,13 @@ def format_prediction_metrics_report(metrics: dict) -> str:
                 "",
                 "Metric definitions",
                 "------------------",
-                "TP  Exact true positive",
+                (
+                    "TP  Within configured TP tolerance"
+                    if event["exact_tolerance_frames"]
+                    else "TP  Exact true positive"
+                ),
                 "PE  Position error",
-                "oPE Outer position error (within ±40 ms)",
+                f"oPE Outer position error (up to ±{event['outer_error_association_frames']} frames)",
                 "Weighted cost = 20 FP + 10 FN + PE + 5 oPE",
                 "FP  Unmatched false positive",
                 "FN  Unmatched false negative",

@@ -24,6 +24,73 @@ Run commands from the repository root. Examples use `my_model` as a new model
 name and illustrative patient paths. Script documentation and `--help` describe
 additional settings.
 
+Training report plots default **off on Jetson** and **on elsewhere**. Detection
+uses `/etc/nv_tegra_release` or a Jetson device-tree model name, so ARM
+workstations retain plotting by default. Use `--plots` or `--no-plots` to
+override this in training, fine-tuning, LOPO and HPO commands. JSON configs
+accept `"plots": true`, `false`, or `null`; null keeps automatic host detection
+when moving a config between machines. The resolved value is logged and saved
+as `plots_enabled`.
+
+With plots disabled, checkpoint/threshold selection, event parquet files,
+threshold-search CSV and numerical JSON reports are still produced. Plotting
+does not import `matplotlib` or `mplhep` in this mode. Enabling plots requires
+the plotting dependencies from the training extras. For example:
+
+```bash
+/home/orin/envs/jet/bin/python run/train.py --help  # lists --plots / --no-plots
+```
+
+The default trigger holdoff is 200 ms: `min_distance=10` at the standard 50 Hz
+model rate. The LOPO recipes use this value, and inference without an explicit
+holdoff uses 200 ms. Saved configs with an explicit `holdoff_frames` or
+`holdoff_ms` continue to take precedence; for example, an existing config with
+`holdoff_frames=20` still requests 400 ms at 50 Hz. Threshold calibration uses
+the configured holdoff.
+
+For an optional second output that recovers the previous frame using one extra
+frame of context, see [previous-frame recovery](recovery-head.md). The existing
+single-output architecture remains the default.
+
+For a single primary output trained at 100 Hz with one subsequent frame of
+context, see [100 Hz previous-frame prediction](100hz-delayed-target.md).
+It uses four-sample frames and separately trained weights; the existing 50 Hz
+workflow remains the default. The guide includes the preset, cache contract,
+GUI behavior and raw-time comparison against 50 Hz and 100 Hz controls.
+Use `./train_models_lopo.sh delayed-100hz --only ecg3 --dry-run` to preview the
+training/publication workflow for `finished_models/ecg3/delayed_100hz/`.
+The 100 Hz metric policy is TP at ±0–1 frame, PE at ±2–3 and oPE at ±4–5.
+The normal model retains TP at the same frame, PE at ±1 and oPE at ±2.
+Metrics schema 4 records these radii; see the guide before comparing reports
+or recalibrating a model trained with the older 100 Hz metric policy.
+
+For the current five-model workflow, use
+[fresh two-output nested LOPO training](recovery-head.md#train-a-two-output-model)
+through `./train_models_lopo.sh`. The wrapper fixes the architecture settings in
+`config/lopo_recipes/`,
+uses a shared learning rate, and calibrates the primary and recovery thresholds
+in two stages. These recipes are independent of the output directories, so this
+workflow can start with empty `models/` and `finished_models/` directories.
+
+Preprocessing is versioned separately through `preprocessing_contract_version`,
+currently **4**. The Python extension and native runtime share the same version
+constant. New training configurations, preprocessing caches, and deployment
+manifests record version 4. Training rejects version 3 caches; regenerate them
+from raw recordings. Inference and deployment also support saved contract-3
+current-frame models at 400 Hz with eight-sample frames and default quality
+histories (10/200 frames), preserving their original version metadata. Contract 3
+cannot describe delayed/four-sample models or new quality horizons. Existing
+configs can also supply settings for fresh training. See the
+[Jetson deployment guide](jetson-model-deployment.md). Rebuild both
+native components after updating:
+
+```bash
+bash run/rebuild_native.sh --python-extension
+```
+
+This contract bump does not change the numerical feature transformations.
+Metrics and threshold-policy versions remain separate.
+
 ## Workstation setup
 
 Use Python 3.10 or 3.11 and a C++ build toolchain. From a fresh checkout:
@@ -33,7 +100,7 @@ bash setup.sh --profile workstation
 ```
 
 This creates or reuses `.venv`, installs the training/export dependencies, builds
-the shared native processing code, and runs the checks. Use `.venv/bin/python`
+the shared native processing code. Development tests are not bundled. Use `.venv/bin/python`
 for subsequent Python commands. A workstation build can run without TensorRT;
 the deployment engine is built on the Jetson.
 

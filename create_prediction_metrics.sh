@@ -10,13 +10,16 @@ PREDICT_SCRIPT="run/offline_predict.py"
 PLOT_SCRIPT="run/create_prediction_plots.py"
 OVERVIEW_SCRIPT="run/create_prediction_metrics_overview.py"
 MODEL_VARIANT="best"
+CV_METHOD=""
 MODELS_ROOT=""
 METRICS_ROOT="metrics"
 OVERVIEW=""
 ONLY_MISSING=0
+DISABLE_RECOVERY=0
 SYNTHETIC_GRADIENT=0
 EXCLUDE_LOW_FREQUENCIES=0
 SAVE_SYNTHETIC=0
+SAVE_PREPPED=0
 THRESHOLD_STEP="0.001"
 MAX_ERROR_PLOTS="12"
 ERROR_WINDOW_FRAMES="25"
@@ -37,14 +40,27 @@ each model/input pair, writes fixed-threshold dashboard and error-example PDFs,
 then creates per-model pooled dashboards, all-input overviews, and a comparison of every
 model against the siemens_tr baseline. The configured threshold is evaluated
 but is never reselected or changed.
+Two-output models automatically use their configured recovery threshold. Logs
+and fixed-threshold dashboards include the recovery output; no extra flag is needed.
+Use --no-recovery to evaluate only the current output of the same trained model.
+Those reports go under <output-dir>/current_only/ for comparison with recovery.
 
 By default every artifact is written under the project's metrics/ folder, with one
 flat subdirectory named exactly after each model:
 
   metrics/<modelname>/...
 
+Full prediction/event parquets are temporary unless --save-prepped is given.
+Saved parquets go under metrics/prepped/ with the same subdirectory layout.
+Small score/annotation caches in metrics/.cache/ allow metrics and plots to be
+rebuilt without repeating inference. Existing saved parquets are reused.
+
 The root prediction_metrics_overview.csv contains one event-weighted pooled
-row per model plus the siemens_tr baseline. Each model directory also receives
+row per model plus the siemens_tr baseline. The matching .txt contains the
+pooled comparison and compact totals. Per-input comparisons are written to
+prediction_metrics_per_input.{txt,csv} beside the overview, grouped by frequency
+for synthetic runs. Text comparison tables omit the type column.
+Each model directory also receives
 prediction_metrics_all_inputs.{txt,csv}, with every input and a pooled row.
 Overviews include exact Se/+P/DER and Beat Se/+P/DER. By default, outer matches
 count as one FP and one FN, with no oPE columns. Use --include-outer-position-errors
@@ -68,14 +84,28 @@ Options:
                              Default: every model directory with artifacts.
   --model-variant VARIANT    Model variant passed to offline_predict.py.
                              Default: best
-  --only-missing             Skip model/input pairs whose event parquet,
-                             prediction log, metrics, plots, and event analysis
-                             already exist.
+  --cv-method METHOD        Select nested_lopo, nested_lopo_hpo, or
+                             nested_recovery_lopo training artifacts.
+                             Default: flat pairs and unambiguous nested runs.
+                             --model accepts the declared name or CV family name.
+  --no-recovery             Disable recovery events; keep the current prediction
+                             and saved calibration. Reports: current_only/.
+  --only-missing             Skip model/input pairs whose cached predictions,
+                             metrics, plots, and event analysis
+                             already exist and match the saved model/runtime settings.
+                             Training settings and calibration audit metadata
+                             do not invalidate predictions. Inference/native
+                             changes do; plotting changes rebuild plots only.
+                             Recovery models require a matching cache key;
+                             older single-output caches remain usable.
+  --save-prepped             Keep full prediction/event parquets under
+                             <output-dir>/prepped/, preserving subdirectories.
+                             Matching saved files are reused with --only-missing.
   --include-outer-position-errors
                              Include outer position errors in overview metrics
                              and columns. Default: count each as FP + FN.
                              Also works with cached predictions (--only-missing).
-  --synthetic-gradient      Evaluate main peaks at 190, 114, 84, 62, 50, 20, 10 Hz,
+  --synthetic-gradient      Evaluate main peaks at 190, 90, 80, 40, 20, 10 Hz,
                              aliasing above Nyquist.
                              Add noise independently (seed 42), then calculate
                              ecg3_syn = ecg2_syn - ecg1_syn. Predictions use
@@ -100,9 +130,14 @@ Options:
                              for rare manual overrides.
 
 Examples:
-  ./create_prediction_metrics.sh finished_models --only-missing --synthetic-gradient --save-synthetic "data/true/p02/p02_head.parquet" "data/true/p14/p14_heart.parquet" "data/true/p14/p14_head.parquet" "data/true/p16/p16_head.parquet" "data/true/p16/p16_heart.parquet" "data/true/p16/p16_pelvis.parquet"
+  # All published normal and recovery models on the six preferred recordings:
+  ./metrics.sh normal
 
-  ./create_prediction_metrics.sh finished_models --only-missing "data/true/p02/p02_head.parquet" "data/true/p14/p14_heart.parquet" "data/true/p14/p14_head.parquet" "data/true/p16/p16_head.parquet" "data/true/p16/p16_heart.parquet" "data/true/p16/p16_pelvis.parquet"
+  # Same recordings with synthetic gradients:
+  ./metrics.sh synthetic
+
+  # Also keep full prediction/event parquets:
+  ./metrics.sh synthetic --save-prepped
 
   ./create_prediction_metrics.sh finished_models 'data/test/p04/*.parquet'
 
@@ -143,8 +178,17 @@ while [[ $# -gt 0 ]]; do
       MODEL_VARIANT="$2"
       shift 2
       ;;
+    --cv-method)
+      [[ $# -ge 2 ]] || die "--cv-method requires a method"
+      CV_METHOD="$2"
+      shift 2
+      ;;
     --only-missing)
       ONLY_MISSING=1
+      shift
+      ;;
+    --no-recovery)
+      DISABLE_RECOVERY=1
       shift
       ;;
     --include-outer-position-errors)
@@ -161,6 +205,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --save-synthetic)
       SAVE_SYNTHETIC=1
+      shift
+      ;;
+    --save-prepped)
+      SAVE_PREPPED=1
+      shift
+      ;;
+    --no-save-prepped)
+      SAVE_PREPPED=0
       shift
       ;;
     --threshold-step)
@@ -203,14 +255,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Honor these switches after -- as well, including artifact/cache separation.
+FORWARDED_PREDICT_ARGS=()
 for arg in "${PREDICT_ARGS[@]}"; do
   case "$arg" in
+    --no-recovery) DISABLE_RECOVERY=1 ;;
     --synthetic-gradient) SYNTHETIC_GRADIENT=1 ;;
     --save-synthetic) SAVE_SYNTHETIC=1 ;;
+    --save-prepped) SAVE_PREPPED=1; continue ;;
+    --no-save-prepped) SAVE_PREPPED=0; continue ;;
     --synthetic-main-frequency-hz|--synthetic-main-frequency-hz=*)
       die "the synthetic sweep sets --synthetic-main-frequency-hz for each configuration" ;;
   esac
+  FORWARDED_PREDICT_ARGS+=("$arg")
 done
+PREDICT_ARGS=("${FORWARDED_PREDICT_ARGS[@]}")
+ARTIFACT_ROOT="$METRICS_ROOT"
+PREPPED_ROOT="$ARTIFACT_ROOT/prepped"
+CACHE_ROOT="$ARTIFACT_ROOT/.cache"
+if [[ "$DISABLE_RECOVERY" -eq 1 ]]; then
+  METRICS_ROOT="$METRICS_ROOT/current_only"
+  PREDICT_ARGS+=(--no-recovery)
+fi
 if [[ "$SAVE_SYNTHETIC" -eq 1 && "$SYNTHETIC_GRADIENT" -eq 0 ]]; then
   die "--save-synthetic requires --synthetic-gradient"
 fi
@@ -316,6 +381,23 @@ safe_stem() {
   fi
 }
 
+prediction_cache_info() {
+  "$PYTHON_BIN" - "$config" "$checkpoint" "$input" "$PREDICT_SCRIPT" \
+    "$MODEL_VARIANT" "${PREDICT_ARGS[@]}" "${CONFIG_PREDICT_ARGS[@]}" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location(
+    "prediction_fingerprint", Path("src/dkfz/live/prediction_fingerprint.py")
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+mode, key = module.prediction_cache_info(*sys.argv[1:5], sys.argv[5:])
+print(mode, key, module.plot_source_key(Path("run/create_prediction_plots.py")))
+PY
+}
+
 extract_metrics() {
   local metrics_file="$1"
   local metrics_json="${metrics_file%.txt}.json"
@@ -343,20 +425,19 @@ extract_siemens_metrics() {
 from pathlib import Path
 import sys
 
-import pandas as pd
-
 src = Path.cwd() / "src"
 if src.is_dir() and str(src) not in sys.path:
     sys.path.insert(0, str(src))
 
 from dkfz.live.eval_metrics import build_siemens_trigger_metrics_report
+from dkfz.live.prediction_cache import read_prediction_frame
 
 
 prediction_log = Path(sys.argv[1])
 target_col = "target"
 error_association_frames = 1
 
-df = pd.read_parquet(prediction_log)
+df = read_prediction_frame(prediction_log)
 report = build_siemens_trigger_metrics_report(
     df,
     target_col=target_col,
@@ -431,23 +512,29 @@ declare -A SEEN_INPUTS=()
 resolve_inputs
 [[ ${#RESOLVED_INPUTS[@]} -gt 0 ]] || die "no parquet inputs found"
 
-if [[ ${#MODELS[@]} -eq 0 ]]; then
-  shopt -s nullglob
-  for checkpoint in "$MODELS_ROOT"/*/"$CHECKPOINT_REL"; do
-    model_dir="$(dirname "$checkpoint")"
-    [[ -f "$model_dir/$CONFIG_REL" ]] || continue
-    MODELS+=("$(basename "$model_dir")")
-  done
-  shopt -u nullglob
-fi
+discovery_args=(list --root "$MODELS_ROOT" --variant "$MODEL_VARIANT")
+[[ -z "$CV_METHOD" ]] || discovery_args+=(--cv-method "$CV_METHOD")
+for model in "${MODELS[@]}"; do
+  discovery_args+=(--model "$model")
+done
+model_listing="$(PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -m dkfz.live.artifact_discovery "${discovery_args[@]}")" || die "could not resolve model artifacts"
+MODELS=()
+declare -A MODEL_DIRS=()
+while IFS=$'\t' read -r model model_dir; do
+  [[ -n "$model" ]] || continue
+  MODELS+=("$model")
+  MODEL_DIRS["$model"]="$model_dir"
+done <<< "$model_listing"
 [[ ${#MODELS[@]} -gt 0 ]] || \
   die "no $MODEL_VARIANT model artifacts found under $MODELS_ROOT"
 
 mkdir -p "$METRICS_ROOT" "$(dirname "$OVERVIEW")"
 : > "$OVERVIEW"
 RECORDS_FILE="$(mktemp "$METRICS_ROOT/.prediction_metrics_records.XXXXXX")"
+WORK_DIR="$(mktemp -d "$METRICS_ROOT/.prediction_work.XXXXXX")"
 cleanup_records() {
   rm -f -- "$RECORDS_FILE"
+  rm -rf -- "$WORK_DIR"
 }
 trap cleanup_records EXIT
 
@@ -472,7 +559,7 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
     section_model_records=0
 
     for model in "${MODELS[@]}"; do
-      model_dir="$MODELS_ROOT/$model"
+      model_dir="${MODEL_DIRS[$model]}"
       checkpoint="$model_dir/$CHECKPOINT_REL"
       config="$model_dir/$CONFIG_REL"
 
@@ -486,21 +573,80 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
       mkdir -p "$artifact_dir"
 
       output_base="compare${OUTPUT_SUFFIX}_${input_stem}"
-      out_events="$artifact_dir/prediction_trigger_events_${output_base}.parquet"
-      out_log="$artifact_dir/prediction_all_events_${output_base}.parquet"
+      relative_dir="${artifact_dir#"$ARTIFACT_ROOT"/}"
+      prepped_dir="$PREPPED_ROOT/$relative_dir"
+      cache_dir="$CACHE_ROOT/$relative_dir"
+      saved_events="$prepped_dir/prediction_trigger_events_${output_base}.parquet"
+      saved_log="$prepped_dir/prediction_all_events_${output_base}.parquet"
+      compact_log="$cache_dir/prediction_all_events_${output_base}.arrow"
+      saved_stamp="$prepped_dir/prediction_all_events_${output_base}_cache.key"
+      # Adopt old outputs without making the model recompute them.
+      for legacy in "$artifact_dir/prediction_trigger_events_${output_base}.parquet" \
+                    "$artifact_dir/prediction_all_events_${output_base}.parquet"; do
+        if [[ -f "$legacy" && ! -e "$prepped_dir/$(basename "$legacy")" ]]; then
+          mkdir -p "$prepped_dir"
+          mv -- "$legacy" "$prepped_dir/"
+        fi
+      done
+      if [[ "$SAVE_PREPPED" -eq 1 ]]; then
+        mkdir -p "$prepped_dir"
+        out_events="$saved_events"
+        out_log="$saved_log"
+      else
+        temporary_dir="$WORK_DIR/$relative_dir"
+        mkdir -p "$temporary_dir"
+        out_events="$temporary_dir/prediction_trigger_events_${output_base}.parquet"
+        out_log="$temporary_dir/prediction_all_events_${output_base}.parquet"
+      fi
       out_metrics="$artifact_dir/prediction_all_events_${output_base}_metrics.txt"
       metrics_json="${out_metrics%.txt}.json"
       run_log="$artifact_dir/prediction_all_events_${output_base}_run.log"
       dashboard="$artifact_dir/prediction_all_events_${output_base}_threshold_dashboard.pdf"
       errors="$artifact_dir/prediction_all_events_${output_base}_threshold_errors.pdf"
       analysis_events="$artifact_dir/prediction_all_events_${output_base}_threshold_events.csv"
+      cache_stamp="$artifact_dir/prediction_all_events_${output_base}_cache.key"
+      plot_stamp="$artifact_dir/prediction_all_events_${output_base}_plots_cache.key"
+
+      if ! cache_info="$(prediction_cache_info)"; then
+        echo "Could not read model/cache settings for $model on $input_name" >&2
+        exit_status=1
+        continue
+      fi
+      read -r output_mode cache_key plot_source_key <<< "$cache_info"
+      plot_key="$(printf '%s\0' "$cache_key" "$plot_source_key" "$THRESHOLD_STEP" "$MAX_ERROR_PLOTS" "$ERROR_WINDOW_FRAMES" | sha256sum)"
+      cache_matches=0
+      if [[ -f "$cache_stamp" ]]; then
+        [[ "$(<"$cache_stamp")" == "$cache_key" ]] && cache_matches=1
+      elif [[ "$output_mode" == "single" ]]; then
+        # Retain compatibility with pre-feature single-output cached reports.
+        cache_matches=1
+      fi
 
       prediction_ok=0
-      if [[ "$ONLY_MISSING" -eq 1 && "$SAVE_SYNTHETIC" -eq 0 && -f "$out_events" && -f "$out_log" && -f "$out_metrics" && -f "$metrics_json" ]]; then
+      prediction_reused=0
+      analysis_log="$compact_log"
+      saved_matches=0
+      if [[ -f "$saved_stamp" ]]; then
+        [[ "$(<"$saved_stamp")" == "$cache_key" ]] && saved_matches=1
+      elif [[ "$cache_matches" -eq 1 && ! -f "$compact_log" && -f "$saved_log" ]]; then
+        # Adopt a legacy parquet whose cache policy was validated above.
+        printf '%s\n' "$cache_key" > "$saved_stamp"
+        saved_matches=1
+      fi
+      if [[ ! -f "$compact_log" && "$saved_matches" -eq 1 && -f "$saved_log" ]]; then
+        analysis_log="$saved_log"
+      fi
+      storage_complete=1
+      if [[ "$SAVE_PREPPED" -eq 1 && ( "$saved_matches" -eq 0 || ! -f "$saved_events" || ! -f "$saved_log" ) ]]; then
+        storage_complete=0
+      fi
+      if [[ "$ONLY_MISSING" -eq 1 && "$SAVE_SYNTHETIC" -eq 0 && "$cache_matches" -eq 1 && "$storage_complete" -eq 1 && -f "$analysis_log" && -f "$out_metrics" && -f "$metrics_json" ]]; then
         echo "Using existing prediction for $model on $input_name" >&2
         prediction_ok=1
+        prediction_reused=1
       else
-        echo "Running $model on $input_name" >&2
+        echo "Running $model on $input_name ($output_mode)" >&2
+        rm -f -- "$cache_stamp" "$plot_stamp"
         if "$PYTHON_BIN" "$PREDICT_SCRIPT" \
           "$input" \
           --modelname "$model" \
@@ -513,6 +659,7 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
           "${CONFIG_PREDICT_ARGS[@]}" \
           > "$run_log" 2>&1; then
           prediction_ok=1
+          analysis_log="$out_log"
         else
           echo "Prediction failed for $model on $input_name; see $run_log" >&2
           exit_status=1
@@ -520,13 +667,43 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
       fi
 
       if [[ "$prediction_ok" -eq 1 ]]; then
-        SUCCESSFUL_PREDICTIONS["$out_log"]=1
-        if [[ "$ONLY_MISSING" -eq 1 && -f "$dashboard" && -f "$errors" && -f "$analysis_events" ]]; then
+        if [[ "$prediction_reused" -eq 0 && "$SAVE_PREPPED" -eq 1 ]]; then
+          printf '%s\n' "$cache_key" > "$saved_stamp"
+        fi
+        if [[ "$prediction_reused" -eq 0 || ! -f "$compact_log" ]]; then
+          if ! PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - "$analysis_log" "$compact_log" "$metrics_json" <<'PY'
+import json
+from pathlib import Path
+import sys
+from dkfz.live.prediction_cache import cache_prediction_frame
+report = json.loads(Path(sys.argv[3]).read_text())
+cache_prediction_frame(Path(sys.argv[1]), Path(sys.argv[2]), report.get("target_col", "target"))
+PY
+          then
+            echo "Could not cache predictions for $model on $input_name" >&2
+            exit_status=1
+            continue
+          fi
+        fi
+        analysis_log="$compact_log"
+        if [[ "$SAVE_PREPPED" -eq 0 ]]; then
+          rm -f -- "$out_log" "$out_events"
+        fi
+        printf '%s\n' "$cache_key" > "$cache_stamp"
+        SUCCESSFUL_PREDICTIONS["$artifact_dir/$output_base"]="$analysis_log"
+        plots_match=0
+        if [[ -f "$plot_stamp" ]]; then
+          [[ "$(<"$plot_stamp")" == "$plot_key" ]] && plots_match=1
+        elif [[ "$output_mode" == "single" ]]; then
+          plots_match=1
+        fi
+        if [[ "$ONLY_MISSING" -eq 1 && "$prediction_reused" -eq 1 && "$plots_match" -eq 1 && -f "$dashboard" && -f "$errors" && -f "$analysis_events" ]]; then
           echo "Using existing plots for $model on $input_name" >&2
+          printf '%s\n' "$plot_key" > "$plot_stamp"
         else
           echo "Creating fixed-threshold plots for $model on $input_name" >&2
           if "$PYTHON_BIN" "$PLOT_SCRIPT" \
-            --prediction-log "$out_log" \
+            --prediction-log "$analysis_log" \
             --config "$config" \
             --metrics-json "$metrics_json" \
             --dashboard "$dashboard" \
@@ -536,7 +713,7 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
             --max-error-plots "$MAX_ERROR_PLOTS" \
             --error-window-frames "$ERROR_WINDOW_FRAMES" \
             >> "$run_log" 2>&1; then
-            :
+            printf '%s\n' "$plot_key" > "$plot_stamp"
           else
             echo "Plot creation failed for $model on $input_name; see $run_log" >&2
             exit_status=1
@@ -563,7 +740,7 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
             fi
 
             if [[ "$section_siemens_recorded" -eq 0 ]]; then
-              if read -r siemens_timepoints siemens_gt_r_peaks siemens_true_positive siemens_position_error siemens_outer_position_error siemens_false_positive siemens_false_negative < <(extract_siemens_metrics "$out_log"); then
+              if read -r siemens_timepoints siemens_gt_r_peaks siemens_true_positive siemens_position_error siemens_outer_position_error siemens_false_positive siemens_false_negative < <(extract_siemens_metrics "$analysis_log"); then
                 if [[ "$section_timepoints" != "$siemens_timepoints" || "$section_gt_r_peaks" != "$siemens_gt_r_peaks" ]]; then
                   echo "Warning: siemens_tr on $input_name produced timepoints=$siemens_timepoints gt_r_peaks=$siemens_gt_r_peaks; section uses timepoints=$section_timepoints gt_r_peaks=$section_gt_r_peaks" >&2
                 fi
@@ -604,9 +781,10 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
     pooled_count=0
     for input in "${RESOLVED_INPUTS[@]}"; do
       input_stem="$(safe_stem "$input")"
-      out_log="$artifact_dir/prediction_all_events_compare${OUTPUT_SUFFIX}_${input_stem}.parquet"
-      if [[ -n "${SUCCESSFUL_PREDICTIONS[$out_log]+x}" ]]; then
-        pooled_args+=(--prediction-log "$out_log" --metrics-json "${out_log%.parquet}_metrics.json")
+      output_base="compare${OUTPUT_SUFFIX}_${input_stem}"
+      prediction_id="$artifact_dir/$output_base"
+      if [[ -n "${SUCCESSFUL_PREDICTIONS[$prediction_id]+x}" ]]; then
+        pooled_args+=(--prediction-log "${SUCCESSFUL_PREDICTIONS[$prediction_id]}" --metrics-json "$artifact_dir/prediction_all_events_${output_base}_metrics.json")
         pooled_count=$((pooled_count + 1))
       fi
     done
@@ -616,7 +794,7 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
     if ! "$PYTHON_BIN" "$PLOT_SCRIPT" \
         --pooled \
         "${pooled_args[@]}" \
-        --config "$MODELS_ROOT/$model/$CONFIG_REL" \
+        --config "${MODEL_DIRS[$model]}/$CONFIG_REL" \
         --dashboard "${pooled_base}_threshold_dashboard.pdf" \
         --threshold-step "$THRESHOLD_STEP" \
         > "${pooled_base}_run.log" 2>&1; then

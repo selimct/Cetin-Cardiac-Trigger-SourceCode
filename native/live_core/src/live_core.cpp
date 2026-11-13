@@ -677,7 +677,9 @@ FeatureFramer::FeatureFramer(FeatureFramerConfig config)
           config_.puls_clip),
       quality_tracker_(
           config_.signal_quality_mode,
-          config_.signal_quality_stats)
+          config_.signal_quality_stats, 1e-6, 0.002, 0.001,
+          config_.signal_quality_puls_flat_window_frames,
+          config_.signal_quality_puls_median_window_frames)
 {
     if (config_.frame_size_raw == 0)
     {
@@ -818,6 +820,8 @@ std::optional<FeatureFrame> FeatureFramer::process_sample(const RawSample &sampl
 
     const auto sample_gap = last_sample_idx_.has_value() &&
         sample_idx != *last_sample_idx_ + 1;
+    if (sample_gap && config_.reset_on_discontinuity)
+        reset();
     if (sample_gap &&
         (config_.ecg_slope_mode != EcgSlopeMode::none ||
          quality_tracker_.enabled()))
@@ -914,7 +918,7 @@ std::optional<FeatureFrame> FeatureFramer::process_sample(const RawSample &sampl
         !pulse_is_constant)
     {
         throw std::invalid_argument(
-            "puls values inside an 8-sample block are not constant as expected.");
+            "puls values inside a model frame are not constant as expected.");
     }
 
     auto block = std::move(raw_block_);
@@ -1012,7 +1016,18 @@ void StreamingTriggerDetector::set_thresholds(
         threshold_ = threshold;
         emission_threshold_ = emission_threshold;
         candidate_.reset();
+        previous_input_.reset();
     }
+}
+
+void StreamingTriggerDetector::set_recovery_threshold(std::optional<double> threshold)
+{
+    if (threshold && (!std::isfinite(*threshold) || *threshold <= 0.0 || *threshold > 1.0))
+    {
+        throw std::invalid_argument("recovery_threshold must be in (0, 1] or absent");
+    }
+    recovery_threshold_ = threshold;
+    previous_input_.reset();
 }
 
 void StreamingTriggerDetector::reset()
@@ -1020,6 +1035,8 @@ void StreamingTriggerDetector::reset()
     last_event_frame_ = -1'000'000'000'000LL;
     candidate_.reset();
     awaiting_below_threshold_ = false;
+    previous_input_.reset();
+    last_event_was_recovery_ = false;
 }
 
 std::optional<TriggerEvent> StreamingTriggerDetector::update(
@@ -1027,7 +1044,45 @@ std::optional<TriggerEvent> StreamingTriggerDetector::update(
     std::int64_t frame_idx,
     std::int64_t sample_idx,
     std::optional<double> time_ms,
-    std::string sid)
+    std::string sid,
+    std::optional<double> recovery_probability,
+    std::optional<TriggerPosition> target)
+{
+    if (target && (recovery_threshold_ || target->frame_idx > frame_idx || target->sample_idx > sample_idx))
+        throw std::invalid_argument("Delayed target must be causal and cannot use recovery");
+    if (recovery_probability &&
+        (!std::isfinite(*recovery_probability) || *recovery_probability < 0.0 || *recovery_probability > 1.0))
+    {
+        throw std::invalid_argument("recovery_probability must be finite and in [0, 1]");
+    }
+    last_event_was_recovery_ = false;
+    // The primary path runs first, with exactly its existing timing. Only an
+    // unhandled, subthreshold previous frame can be rescued immediately now.
+    auto event = update_primary(probability, frame_idx, sample_idx, time_ms, sid, target);
+    if (!event && recovery_threshold_ && recovery_probability && previous_input_ &&
+        previous_input_->sid == sid && previous_input_->frame_idx + 1 == frame_idx &&
+        previous_input_->probability < threshold_ && probability < threshold_ &&
+        !candidate_ && !awaiting_below_threshold_ &&
+        frame_idx - last_event_frame_ >= holdoff_frames_ &&
+        previous_input_->frame_idx > last_event_frame_ &&
+        *recovery_probability >= *recovery_threshold_)
+    {
+        candidate_ = previous_input_;
+        candidate_->probability = *recovery_probability;
+        event = emit_candidate(frame_idx, sample_idx, time_ms);
+        last_event_was_recovery_ = true;
+    }
+    previous_input_ = Candidate{std::move(sid), frame_idx, sample_idx, time_ms, probability};
+    return event;
+}
+
+std::optional<TriggerEvent> StreamingTriggerDetector::update_primary(
+    double probability,
+    std::int64_t frame_idx,
+    std::int64_t sample_idx,
+    std::optional<double> time_ms,
+    std::string sid,
+    std::optional<TriggerPosition> target)
 {
     // After early emission, consume the tail of the same detection excursion.
     // Check this even during holdoff so a later excursion can rearm normally.
@@ -1055,9 +1110,9 @@ std::optional<TriggerEvent> StreamingTriggerDetector::update(
     {
         Candidate next{
             std::move(sid),
-            frame_idx,
-            sample_idx,
-            time_ms,
+            target ? target->frame_idx : frame_idx,
+            target ? target->sample_idx : sample_idx,
+            target ? target->time_ms : time_ms,
             probability,
         };
         if (!candidate_.has_value() || probability > candidate_->probability)
@@ -1104,6 +1159,7 @@ TriggerEvent StreamingTriggerDetector::emit_candidate(
         sample_idx,
         time_ms,
         peak.probability,
+        std::nullopt, std::nullopt,
     };
 }
 

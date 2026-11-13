@@ -239,4 +239,4 @@ fi
 
 printf 'Setup complete: profile=%s python=%s TensorRT=%s\n' \
     "${profile}" "${with_python}" "${tensorrt_mode}"
-printf 'For subsequent C++ edits run: bash run/build_native.sh\n'
+printf 'For subsequent runtime updates run: bash run/rebuild_native.sh\n'

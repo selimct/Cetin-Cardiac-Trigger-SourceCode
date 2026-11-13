@@ -12,7 +12,6 @@ from pathlib import Path
 import sys
 
 import numpy as np
-import onnxruntime as ort
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -77,9 +76,7 @@ def main() -> int:
     checkpoint = (
         Path(args.checkpoint)
         if args.checkpoint
-        else default_checkpoint_path(
-            args.modelname, args.model_variant, args.model_dir
-        )
+        else default_checkpoint_path(args.modelname, args.model_variant, args.model_dir)
     )
     onnx_path = (
         Path(args.onnx)
@@ -96,6 +93,7 @@ def main() -> int:
                 path,
                 modelname=args.modelname,
                 model_dir=args.model_dir,
+                model_variant=args.model_variant,
                 label=label,
             )
     except ValueError as exc:
@@ -105,13 +103,29 @@ def main() -> int:
         args.modelname, config_path, args.model_variant, args.model_dir
     )
 
+    from dkfz.live.onnx_export import validate_onnx_prediction_contract
+
+    validate_onnx_prediction_contract(cfg, onnx_path)
     inputs = make_parity_inputs(
         cfg, samples=args.samples, prepped_file=args.prepped_file
     )
     torch_logits = torch_reference_logits(cfg, checkpoint, inputs)
 
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    onnx_logits = _run_onnx(session, inputs)
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+
+        session = ReferenceEvaluator(onnx.load(str(onnx_path)))
+        onnx_logits = np.concatenate([
+            session.run(["logit"], {"x": window[None]})[0] for window in inputs
+        ], axis=0)
+        print("ONNX backend: CPU ReferenceEvaluator (onnxruntime unavailable)")
+    else:
+        session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        onnx_logits = _run_onnx(session, inputs)
+        print("ONNX backend: CPUExecutionProvider")
 
     passed = print_parity_report(
         reference=torch_logits,

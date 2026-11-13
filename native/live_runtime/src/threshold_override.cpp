@@ -147,3 +147,84 @@ ThresholdOverrideUpdate ThresholdOverrideReader::poll()
     }
 }
 } // namespace dkfz::live
+
+namespace dkfz::live
+{
+RecoveryOverrideReader::RecoveryOverrideReader(std::filesystem::path path,
+    DeploymentManifest manifest, std::string invocation)
+    : path_(std::move(path)), manifest_(std::move(manifest)), invocation_(std::move(invocation)) {}
+
+RecoveryOverrideUpdate RecoveryOverrideReader::poll()
+{
+    if (path_.empty() || invocation_.empty()) return {};
+    RecoveryOverrideUpdate update;
+    bool new_contents = false;
+    try
+    {
+        if (!std::filesystem::exists(path_)) { last_state_ = "missing"; return {}; }
+        if (!std::filesystem::is_regular_file(path_) || std::filesystem::is_symlink(path_))
+            throw std::runtime_error("Recovery override must be a regular non-symlink file");
+        std::ifstream input(path_, std::ios::binary);
+        if (!input) throw std::runtime_error("Cannot open recovery override");
+        std::string text(2049, '\0');
+        input.read(text.data(), static_cast<std::streamsize>(text.size()));
+        text.resize(static_cast<std::size_t>(input.gcount()));
+        if (input.bad() || text.size() > 2048) throw std::runtime_error("Invalid recovery override size/read");
+        if (last_state_ == text) return {};
+        last_state_ = text;
+        new_contents = true;
+        std::map<std::string, std::string> values;
+        std::istringstream lines(text);
+        std::string line;
+        while (std::getline(lines, line))
+        {
+            line = trim(line);
+            if (line.empty()) continue;
+            const auto at = line.find('=');
+            if (at == std::string::npos || !values.emplace(trim(line.substr(0, at)), trim(line.substr(at+1))).second)
+                throw std::runtime_error("Malformed recovery override");
+        }
+        if (values.size() != 9 || values.at("schema") != "dkfz-live-recovery-override-v1")
+            throw std::runtime_error("Unsupported recovery override schema");
+        if (!manifest_.engine_size_bytes || !manifest_.engine_crc32 ||
+            values.at("model_name") != manifest_.model_name ||
+            values.at("model_variant") != manifest_.model_variant ||
+            values.at("engine_size_bytes") != std::to_string(*manifest_.engine_size_bytes) ||
+            values.at("engine_crc32") != *manifest_.engine_crc32 ||
+            values.at("service_invocation_id") != invocation_)
+            throw std::runtime_error("Recovery override belongs to another deployment/invocation");
+        const auto &id = values.at("request_id");
+        if (id.empty() || id.find_first_not_of("0123456789") != std::string::npos)
+            throw std::runtime_error("Invalid recovery request ID");
+        update.request_id = std::stoull(id);
+        if (update.request_id == 0) throw std::runtime_error("Invalid recovery request ID");
+        const auto &enabled = values.at("enabled");
+        if (enabled != "true" && enabled != "false") throw std::runtime_error("Invalid recovery enabled state");
+        const auto &selected = values.at("selected_threshold");
+        std::optional<double> threshold;
+        if (!selected.empty())
+        {
+            std::size_t used = 0;
+            const auto value = std::stod(selected, &used);
+            if (used != selected.size() || !std::isfinite(value) || value <= 0 || value > 1)
+                throw std::runtime_error("Recovery threshold must be finite within (0, 1]");
+            threshold = value;
+        }
+        if (!manifest_.recovery_head || (enabled == "true" && !threshold))
+            throw std::runtime_error("Recovery requires two outputs and an explicit threshold");
+        update.threshold = enabled == "true" ? threshold : std::nullopt;
+        update.changed = true;
+        return update;
+    }
+    catch (const std::exception &error)
+    {
+        const auto state = "error:" + std::string(error.what());
+        if (!new_contents) {
+            if (state == last_state_) return {};
+            last_state_ = state;
+        }
+        update.error = error.what();
+        return update;
+    }
+}
+}

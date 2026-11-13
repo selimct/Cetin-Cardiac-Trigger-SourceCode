@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Developed at the German Cancer Research Center (DKFZ).
 
-"""Helpers for expanding saved live 50 Hz frames back to a 400 Hz grid."""
+"""Helpers for expanding saved model frames back to a raw-sample grid."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def framed_ecg_columns(ecg_cols: tuple[str, ...], factor: int) -> set[str]:
 def infer_framed_ecg_columns(
     df50: pd.DataFrame,
     *,
-    factor: int | None = 8,
+    factor: int | None = None,
 ) -> tuple[tuple[str, ...], int]:
     """Infer complete ``ecg*_t0..tN`` channel groups from a framed dataframe."""
     suffixes_by_channel: dict[str, set[int]] = {}
@@ -92,7 +92,7 @@ def _expanded_time_ms(
 def unframe_live_dataframe(
     df50: pd.DataFrame,
     *,
-    factor: int | None = 8,
+    factor: int | None = None,
     raw_idx_col: str = "raw_idx",
     block_index_col: str = "frame_idx",
     ecg_cols: tuple[str, ...] | None = None,
@@ -107,7 +107,7 @@ def unframe_live_dataframe(
     drop_internal_columns: bool = True,
     order_columns: bool = True,
 ) -> pd.DataFrame:
-    """Expand saved live 50 Hz rows to one row per 400 Hz sample.
+    """Expand saved model rows to one row per raw sample.
 
     This is a script-friendly adapter around
     :func:`dkfz.core.frame_to_50hz.unframe_df_50hz_to_400hz`. It accepts both

@@ -26,6 +26,7 @@ from dkfz.live.model_variants import (  # noqa: E402
     MODEL_VARIANT_CHOICES,
     default_config_path,
     default_trt_engine_path,
+    get_model_variant,
     require_config_modelname,
     require_model_artifact_path,
 )
@@ -40,6 +41,11 @@ def main() -> int:
     parser.add_argument("--config", default=None)
     parser.add_argument("--engine", default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--no-recovery",
+        action="store_true",
+        help="Disable recovery events in the manifest, preserving the two-output engine.",
+    )
     parser.add_argument(
         "--model-dir",
         default=None,
@@ -60,9 +66,7 @@ def main() -> int:
     engine_path = (
         Path(args.engine)
         if args.engine
-        else default_trt_engine_path(
-            args.modelname, args.model_variant, args.model_dir
-        )
+        else default_trt_engine_path(args.modelname, args.model_variant, args.model_dir)
     )
     output_path = (
         Path(args.output)
@@ -76,6 +80,7 @@ def main() -> int:
             config_path,
             modelname=args.modelname,
             model_dir=args.model_dir,
+            model_variant=args.model_variant,
             label="training config",
         )
         if not args.allow_engine_outside_model_dir:
@@ -83,12 +88,15 @@ def main() -> int:
                 engine_path,
                 modelname=args.modelname,
                 model_dir=args.model_dir,
+                model_variant=args.model_variant,
                 label="TensorRT engine",
             )
     except ValueError as exc:
         parser.error(str(exc))
     with config_path.open("r", encoding="utf-8") as source:
         cfg = json.load(source)
+    if args.no_recovery:
+        cfg["recovery_enabled"] = False
     try:
         require_config_modelname(
             cfg,
@@ -103,7 +111,9 @@ def main() -> int:
         engine_path=engine_path,
         model_variant=args.model_variant,
         source_model_dir=repo_relative_path(
-            args.model_dir or Path("models") / args.modelname
+            get_model_variant(args.model_variant).model_dir(
+                args.modelname, args.model_dir
+            ).resolve()
         ),
     )
     print(f"Wrote native deployment manifest to {repo_relative_path(output_path)}")

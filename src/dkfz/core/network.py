@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +55,7 @@ def train_torch(
     history_filename: str | Path = "train_history.json",
     progress: bool = True,
     epoch_checkpoint_dir: str | Path | None = None,
+    cache_frozen_recovery: bool = True,
 ) -> tuple[list[float], list[float]]:
     """Train a binary sequence classifier for the live ECG pipeline.
 
@@ -85,6 +87,8 @@ def train_torch(
         epoch_checkpoint_dir (str | Path | None, optional): When provided,
             save one state dict after every epoch. Relative paths are resolved
             below the model directory. Defaults to None.
+        cache_frozen_recovery (bool, optional): Reuse frozen LSTM representations
+            for supported CPU recovery-only training. Defaults to True.
 
     Returns:
         tuple[list[float], list[float]]: Returns Train_losses and Val_losses.
@@ -141,6 +145,20 @@ def train_torch(
     train_losses: list[float] = []
     val_losses: list[float] = []
 
+    forward_model = model
+    if (
+        cache_frozen_recovery
+        and int(num_epochs) > 1
+        # Importing core.model seeds torch; unrelated models must not import it
+        # through this optional optimization after their training seed was set.
+        and type(model).__module__ == "dkfz.core.model"
+    ):
+        from dkfz.core.frozen_recovery import cached_recovery_training
+
+        forward_model, train_loader, val_loader = cached_recovery_training(
+            model, train_loader, val_loader, device
+        )
+
     for epoch in range(1, int(num_epochs) + 1):
         epoch_started = time.perf_counter()
 
@@ -154,7 +172,7 @@ def train_torch(
             batch_items = int(x.shape[0])
 
             optimizer.zero_grad(set_to_none=True)
-            loss = _loss_for_batch(model, criterion, x, y, amp_enabled)
+            loss = _loss_for_batch(forward_model, criterion, x, y, amp_enabled)
             scaler.scale(loss).backward()
             if grad_clip_norm is not None:
                 scaler.unscale_(optimizer)
@@ -181,7 +199,7 @@ def train_torch(
                     y = y.to(device, non_blocking=non_blocking)
                     batch_items = int(x.shape[0])
 
-                    loss = _loss_for_batch(model, criterion, x, y, amp_enabled)
+                    loss = _loss_for_batch(forward_model, criterion, x, y, amp_enabled)
                     val_total += float(loss.detach()) * batch_items
                     val_items += batch_items
 
@@ -240,13 +258,17 @@ def eval_torch(
     model,
     val_loader,
     error_association_frames=1,
-    holdoff_frames=20,
+    holdoff_frames=10,
     threshold_objective="min_error",
     threshold_sensitivity_efficiency=0.95,
     device=None,
     use_amp=True,
     return_threshold_selection=False,
     outer_error_association_frames=2,
+    recovery_max_fp_increase=0.10,
+    recovery_min_extra_fp_per_minute=0.5,
+    frame_hz=50.0,
+    primary_policy=None,
 ):
     """Evaluate a trained model on ground truth annotated data.
 
@@ -255,8 +277,8 @@ def eval_torch(
         val_loader (DataLoader): Input validation set.
         error_association_frames (int, optional): Maximum frame distance used
             only to attribute a non-exact prediction as one position error.
-            Exact-match tolerance is always zero. Defaults to 1.
-        holdoff_frames (int, optional): Number of minimum frames between r peak predictions. Defaults to 20.
+            TP tolerance is zero at 50 Hz and one frame at 100 Hz. Defaults to 1 for the 50 Hz PE radius.
+        holdoff_frames (int, optional): Number of minimum frames between r peak predictions. Defaults to 10 (200 ms at 50 Hz).
         threshold_objective (str, optional): Use ``min_error`` or conservative
             ``min_fp`` selection. Defaults to ``min_error``.
         threshold_sensitivity_efficiency (float, optional): Fraction of the
@@ -277,6 +299,9 @@ def eval_torch(
         Tuple containing the results DataFrame and either the selected threshold
         or its full ``ThresholdSelection`` details.
     """
+    from dkfz.live.event_matching import tp_tolerance_frames
+
+    exact_tolerance_frames = tp_tolerance_frames(frame_hz)
     import pandas as pd
 
     device = _device_or_default(device)
@@ -286,6 +311,7 @@ def eval_torch(
 
     probs_by_seq = defaultdict(list)
     targ_by_seq = defaultdict(list)
+    recovery_by_seq = defaultdict(list)
 
     with torch.inference_mode():
         for batch in val_loader:
@@ -300,27 +326,35 @@ def eval_torch(
                 logits = _extract_logits(model(x)).reshape(batch_size, -1)
 
             y_flat = y.detach().cpu().reshape(batch_size, -1)
-            if logits.shape[1] != 1:
+            if logits.shape[1] not in (1, 2):
                 raise ValueError(
                     f"Expected one logit per sample, got logits.shape={tuple(logits.shape)}"
                 )
-            if y_flat.shape[1] != 1:
+            if y_flat.shape[1] != logits.shape[1]:
                 raise ValueError(
                     f"Expected one target per sample, got y.shape={tuple(y.shape)}"
                 )
 
             probs_np = torch.sigmoid(logits[:, 0].float()).cpu().numpy()
             y_np = y_flat[:, 0].float().numpy()
+            recovery_np = (
+                torch.sigmoid(logits[:, 1].float()).cpu().numpy()
+                if logits.shape[1] == 2
+                else None
+            )
             seq_keys = _seq_ids_to_list(seq_id, batch_size)
 
             for i in range(batch_size):
                 probs_by_seq[seq_keys[i]].append(float(probs_np[i]))
                 targ_by_seq[seq_keys[i]].append(float(y_np[i]))
+                if logits.shape[1] == 2:
+                    recovery_by_seq[seq_keys[i]].append(float(recovery_np[i]))
 
     gap_len = int(max(holdoff_frames + 1, 2 * error_association_frames + 1, 20))
     long_prob_parts = []
     long_targ_parts = []
     long_seq_parts = []
+    long_recovery_parts = []
 
     for seq_key in probs_by_seq.keys():
         p = np.asarray(probs_by_seq[seq_key], dtype=np.float32)
@@ -333,6 +367,10 @@ def eval_torch(
         long_prob_parts.append(np.zeros(gap_len, dtype=np.float32))
         long_targ_parts.append(np.zeros(gap_len, dtype=np.float32))
         long_seq_parts.append(np.full(gap_len, None, dtype=object))
+        if recovery_by_seq:
+            recovery = np.asarray(recovery_by_seq[seq_key], dtype=np.float32)
+            recovery[0] = 0.0
+            long_recovery_parts.extend((recovery, np.zeros(gap_len, dtype=np.float32)))
 
     if not long_prob_parts:
         raise ValueError("val_loader produced no samples.")
@@ -350,14 +388,93 @@ def eval_torch(
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
         outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
     )
+    if primary_policy is not None:
+        from dkfz.live.event_matching import compute_event_position_metrics
+
+        fixed = float(primary_policy["threshold"])
+        if not 0 <= fixed <= 1:
+            raise ValueError("The fixed primary threshold must be in [0, 1]")
+        measured = compute_event_position_metrics(
+            streaming_trigger_peaks(long_prob, fixed, holdoff_frames),
+            target_rpeaks,
+            error_association_frames=error_association_frames,
+            outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
+        )
+        from dkfz.core.network_helpers import evaluate_threshold_grid
+
+        fixed_row = dict(
+            evaluate_threshold_grid(
+                long_prob,
+                target_rpeaks,
+                thresholds=[fixed],
+                holdoff_frames=holdoff_frames,
+                error_association_frames=error_association_frames,
+                outer_error_association_frames=outer_error_association_frames,
+                exact_tolerance_frames=exact_tolerance_frames,
+            )[0]
+        )
+        search_rows = [
+            dict(row, selected=False)
+            for row in threshold_selection.search_rows
+            if not np.isclose(row["threshold"], fixed, atol=1e-7, rtol=0)
+        ]
+        fixed_row.update(selected=True, sensitivity_floor_met=True)
+        search_rows.append(fixed_row)
+        threshold_selection = replace(
+            threshold_selection,
+            threshold=fixed,
+            metrics=measured,
+            fp_threshold=(
+                primary_policy.get("fp_threshold")
+                if primary_policy.get("fp_threshold") is not None
+                else fixed
+            ),
+            der_threshold=(
+                primary_policy.get("der_threshold")
+                if primary_policy.get("der_threshold") is not None
+                else fixed
+            ),
+            search_rows=tuple(sorted(search_rows, key=lambda row: row["threshold"])),
+        )
     best_th = threshold_selection.threshold
+    if recovery_by_seq:
+        from dkfz.live.recovery import calibrate_recovery
+
+        if not np.isfinite(frame_hz) or frame_hz <= 0:
+            raise ValueError("frame_hz must be finite and positive")
+        dual_prob = np.column_stack((long_prob, np.concatenate(long_recovery_parts)))
+        threshold_selection, recovery_search = calibrate_recovery(
+            dual_prob,
+            target_rpeaks,
+            threshold_selection,
+            holdoff_frames=holdoff_frames,
+            error_association_frames=error_association_frames,
+            outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
+            max_fp_increase=recovery_max_fp_increase,
+            min_extra_fp_per_minute=recovery_min_extra_fp_per_minute,
+            validation_minutes=sum(len(values) for values in probs_by_seq.values())
+            / float(frame_hz)
+            / 60,
+        )
 
     pred_rpeaks = streaming_trigger_peaks(
         long_prob,
         threshold=float(best_th),
         holdoff_frames=holdoff_frames,
     )
+    if threshold_selection.recovery_threshold is not None:
+        from dkfz.live.recovery import recovery_peaks
+
+        pred_rpeaks = recovery_peaks(
+            dual_prob,
+            threshold=best_th,
+            recovery_threshold=threshold_selection.recovery_threshold,
+            holdoff_frames=holdoff_frames,
+        )
 
     result = pd.DataFrame(
         {
@@ -371,6 +488,9 @@ def eval_torch(
     result["best_th"] = best_th
     result["fp_threshold"] = threshold_selection.fp_threshold
     result["der_threshold"] = threshold_selection.der_threshold
+    if recovery_by_seq:
+        result["recovery_prob"] = dual_prob[:, 1]
+        result.attrs["recovery_threshold_search"] = recovery_search
     if return_threshold_selection:
         return result, threshold_selection
     return result, best_th
@@ -383,7 +503,8 @@ def predict_torch(
     window_size=25,
     device=None,
     use_amp=True,
-    holdoff_frames: int | None = 20,
+    holdoff_frames: int | None = 10,
+    recovery_threshold: float | None = None,
 ):
     """Return frame-aligned probabilities and live-trigger predictions.
 
@@ -394,7 +515,7 @@ def predict_torch(
         window_size (int, optional): Window size. Defaults to 25.
         device (str | torch.device | None, optional): CUDA or CPU. Defaults to None.
         use_amp (bool, optional): Automatic mixed precision for CUDA optimisation. Defaults to True.
-        holdoff_frames (int | None, optional): Number of minimum frames between r peak predictions. Defaults to 20.
+        holdoff_frames (int | None, optional): Number of minimum frames between r peak predictions. Defaults to 10 (200 ms at 50 Hz).
 
     Returns:
         List(np.darray, np.darray): Returns probs and preds.
@@ -409,24 +530,66 @@ def predict_torch(
     amp_enabled = bool(use_amp and device.type == "cuda")
 
     probs = []
+    sequence_keys = []
     with torch.inference_mode():
         for batch in loader:
             x, _y = _batch_xy(batch)
             x = x.to(device, non_blocking=True)
 
             with _autocast_context(amp_enabled):
-                logits = _extract_logits(model(x))
-            batch_probs = torch.sigmoid(logits).detach().cpu().reshape(-1).numpy()
+                logits = _extract_logits(model(x)).reshape(x.shape[0], -1)
+            batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
             probs.extend(batch_probs)
+            sequence_keys.extend(
+                _seq_ids_to_list(batch[2], len(x)) if len(batch) >= 3 else [0] * len(x)
+            )
 
-    probs = np.asarray(probs, dtype=np.float32)
-    probs = np.pad(probs, (window_size - 1, 0), "constant", constant_values=(0, 0))
+    values = np.asarray(probs, dtype=np.float32)
+    dual = values.ndim == 2 and values.shape[1] == 2
+    probs = np.pad(
+        values[:, 0] if values.ndim == 2 else values,
+        (window_size - 1, 0),
+        "constant",
+        constant_values=(0, 0),
+    )
 
     pred_rpeaks = streaming_trigger_peaks(
         probs,
         threshold=float(threshold),
         holdoff_frames=int(holdoff_frames),
     )
+    if recovery_threshold is not None:
+        if not dual:
+            raise ValueError("recovery_threshold requires a two-output model")
+        from dkfz.live.recovery import recovery_peaks
+
+        # The legacy helper pads its flattened output once. Reset the new
+        # detector for each sequence so recovery never reaches into another
+        # recording, including when a sequence starts in the middle of a batch.
+        boundaries = (
+            [0]
+            + [
+                i
+                for i in range(1, len(sequence_keys))
+                if sequence_keys[i] != sequence_keys[i - 1]
+            ]
+            + [len(values)]
+        )
+        pred_rpeaks = []
+        for start, stop in zip(boundaries, boundaries[1:]):
+            chunk = values[start:stop].copy()
+            if not len(chunk):
+                continue
+            chunk[0, 1] = 0.0
+            pred_rpeaks.extend(
+                index + start + window_size - 1
+                for index in recovery_peaks(
+                    chunk,
+                    threshold=threshold,
+                    recovery_threshold=recovery_threshold,
+                    holdoff_frames=holdoff_frames,
+                )
+            )
     preds = np.zeros(len(probs), dtype=int)
     preds[pred_rpeaks] = 1
     return probs, preds

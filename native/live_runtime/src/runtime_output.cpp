@@ -84,7 +84,11 @@ void emit_trigger_json(std::ostream &output, const TriggerEvent &event)
         output << "null";
     }
     output
-        << ",\"probability\":" << std::setprecision(9) << event.probability
+        << ",\"decision_monotonic_ns\":";
+    if (event.decision_monotonic_ns) output << *event.decision_monotonic_ns; else output << "null";
+    output << ",\"gpio_asserted_monotonic_ns\":";
+    if (event.gpio_asserted_monotonic_ns) output << *event.gpio_asserted_monotonic_ns; else output << "null";
+    output << ",\"probability\":" << std::setprecision(9) << event.probability
         << "}\n";
 }
 
@@ -95,6 +99,22 @@ void emit_probability_json(
     output
         << "{\"schema\":\"dkfz-live-probability-v1\""
         << ",\"sid\":\"" << json_escape(record.sid) << '"'
+        << ",\"processing_duration_ns\":" << record.processing_duration_ns
+        << ",\"preprocessing_ns\":" << record.preprocessing_ns
+        << ",\"window_assembly_ns\":" << record.window_assembly_ns
+        << ",\"inference_ns\":" << record.inference_ns
+        << ",\"trigger_ns\":" << record.trigger_ns
+        << ",\"cpu_thread_ns\":" << record.cpu_thread_ns
+        << ",\"sample_queue_wait_ns\":" << record.sample_queue_wait_ns
+        << ",\"gpu_upload_ns\":" << record.gpu_upload_ns
+        << ",\"gpu_compute_ns\":" << record.gpu_compute_ns
+        << ",\"gpu_download_ns\":" << record.gpu_download_ns
+        << ",\"cuda_graph\":" << (record.cuda_graph ? "true" : "false")
+        << ",\"frame_end_to_completion_ns\":" << record.frame_end_to_completion_ns
+        << ",\"completed_monotonic_ns\":" << record.completed_monotonic_ns
+        << ",\"decoded_monotonic_ns\":" << record.decoded_monotonic_ns
+        << ",\"backlog_samples\":" << record.backlog_samples
+        << ",\"missed_deadline\":" << (record.missed_deadline ? "true" : "false")
         << ",\"frame_idx_50hz\":" << record.frame_idx
         << ",\"start_sample_idx_400hz\":" << record.start_sample_idx
         << ",\"end_sample_idx_400hz\":" << record.end_sample_idx
@@ -111,8 +131,22 @@ void emit_probability_json(
         << ",\"model_output\":" << std::setprecision(9) << record.model_output
         << ",\"probability\":" << record.probability
         << ",\"trigger_emitted_now\":"
-        << (record.trigger_emitted_now ? "true" : "false")
-        << "}\n";
+        << (record.trigger_emitted_now ? "true" : "false");
+    if (record.observed_frame_idx) {
+        output << ",\"prediction_delay_frames\":1"
+               << ",\"observed_frame_idx\":" << *record.observed_frame_idx
+               << ",\"observed_raw_idx\":" << record.observed_start_sample_idx
+               << ",\"observed_raw_frame_end_idx\":" << record.observed_end_sample_idx
+               << ",\"observed_time_ms\":";
+        if (record.observed_time_ms) output << std::setprecision(17) << *record.observed_time_ms;
+        else output << "null";
+    }
+    if (record.recovery_probability)
+    {
+        output << ",\"recovery_prob\":" << *record.recovery_probability
+               << ",\"recovery_emitted_now\":" << (record.recovery_emitted_now ? "true" : "false");
+    }
+    output << "}\n";
 }
 
 class FileDescriptor
@@ -340,11 +374,19 @@ class ConfiguredRuntimeOutputSink final : public RuntimeOutputSink
         {
             throw std::runtime_error("Runtime output sink is closed");
         }
+        auto trigger = record.trigger;
         if (record.kind == RuntimeOutputRecordKind::trigger &&
             runtime_output_has_gpio(config_.mode))
         {
             wait_for_minimum_idle();
             trigger_line_->set_active(true);
+            timespec asserted{};
+            if (::clock_gettime(CLOCK_MONOTONIC, &asserted) != 0) {
+                set_inactive_and_start_idle();
+                throw std::runtime_error("Cannot timestamp GPIO assertion");
+            }
+            trigger.gpio_asserted_monotonic_ns = static_cast<std::uint64_t>(asserted.tv_sec) * 1'000'000'000ULL +
+                static_cast<std::uint64_t>(asserted.tv_nsec);
             try
             {
                 sleep_for_monotonic(config_.gpio.pulse_width_ns);
@@ -367,7 +409,7 @@ class ConfiguredRuntimeOutputSink final : public RuntimeOutputSink
         {
             if (record.kind == RuntimeOutputRecordKind::trigger)
             {
-                emit_trigger_json(jsonl_output_, record.trigger);
+                emit_trigger_json(jsonl_output_, trigger);
             }
             else
             {

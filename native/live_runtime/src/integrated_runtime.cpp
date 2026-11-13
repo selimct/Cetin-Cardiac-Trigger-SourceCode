@@ -17,6 +17,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -30,6 +31,14 @@ namespace dkfz::live
 {
 namespace
 {
+
+std::uint64_t thread_cpu_ns()
+{
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0)
+        throw std::runtime_error("Unable to read inference thread CPU clock");
+    return static_cast<std::uint64_t>(value.tv_sec) * 1'000'000'000ULL + value.tv_nsec;
+}
 
 class FailureState
 {
@@ -104,6 +113,7 @@ IntegratedLiveRuntime::IntegratedLiveRuntime(
       diagnostic_output_(diagnostic_output)
 {
     validate_deployment_manifest(manifest_);
+    check_required_realtime_limit(config_.scheduling);
     if (!engine_)
     {
         throw std::invalid_argument("Integrated runtime requires an engine");
@@ -192,6 +202,10 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
     auto pipeline = std::make_shared<LiveInferencePipeline>(
         manifest_, std::move(engine_), config_.early_emission);
     ThresholdOverrideReader threshold_reader(config_.threshold_override_path, manifest_);
+    const std::string service_invocation = std::getenv("INVOCATION_ID") ? std::getenv("INVOCATION_ID") : "";
+    RecoveryOverrideReader recovery_reader(!manifest_.recovery_head || config_.threshold_override_path.empty()
+        ? std::filesystem::path{} : std::filesystem::path(config_.threshold_override_path.string() + ".recovery"),
+        manifest_, service_invocation);
     auto reported_policy = pipeline->active_policy();
     auto requested_policy = reported_policy;
     auto manual_threshold = manifest_.manual_threshold;
@@ -201,6 +215,21 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
     auto report_threshold = [&]()
     {
         const auto active = pipeline->active_policy();
+        if (active.recovery_request_id != reported_policy.recovery_request_id)
+        {
+            logger.emit(DiagnosticSeverity::info, "recovery_applied", "inference",
+                "Recovery policy applied at a completed frame; previous emissions and holdoff retained",
+                {{"recovery_api_version", std::uint64_t{1}},
+                 {"recovery_request_id", std::to_string(active.recovery_request_id)},
+                 {"service_invocation_id", service_invocation},
+                 {"model_name", manifest_.model_name}, {"model_variant", manifest_.model_variant},
+                 {"engine_size_bytes", std::to_string(manifest_.engine_size_bytes.value_or(0))},
+                 {"engine_crc32", manifest_.engine_crc32.value_or("")},
+                 {"threshold", active.threshold}, {"early_emission", active.early_emission},
+                 {"emission_threshold", active.early_emission ? std::max(active.threshold, manifest_.emission_reference_threshold()) : active.threshold},
+                 {"active_recovery_enabled", active.recovery_threshold.has_value()},
+                 {"active_recovery_threshold", active.recovery_threshold.value_or(-1)}});
+        }
         if (active.threshold != reported_policy.threshold ||
             active.early_emission != reported_policy.early_emission)
         {
@@ -214,8 +243,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                          {"emission_threshold", active.early_emission
                              ? std::max(active.threshold, manifest_.emission_reference_threshold())
                              : active.threshold}});
-            reported_policy = active;
         }
+        reported_policy = active;
     };
     auto poll_threshold = [&]()
     {
@@ -256,7 +285,23 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
             file_policy = TriggerPolicy{*update.threshold,
                 update.early_emission.value_or(config_.early_emission)};
         }
+        const auto recovery_update = recovery_reader.poll();
+        if (!recovery_update.error.empty())
+            logger.emit(DiagnosticSeverity::warning, "recovery_rejected", "inference", recovery_update.error,
+                {{"recovery_request_id", std::to_string(recovery_update.request_id)},
+                 {"service_invocation_id", service_invocation}});
         auto desired = file_policy.value_or(TriggerPolicy{manifest_.threshold, config_.early_emission});
+        desired.recovery_threshold = recovery_update.changed
+            ? recovery_update.threshold : requested_policy.recovery_threshold;
+        desired.recovery_request_id = recovery_update.changed
+            ? recovery_update.request_id : requested_policy.recovery_request_id;
+        if (recovery_update.changed)
+            logger.emit(DiagnosticSeverity::info, "recovery_requested", "inference",
+                "Recovery request queued for the next completed frame",
+                {{"recovery_request_id", std::to_string(desired.recovery_request_id)},
+                 {"service_invocation_id", service_invocation},
+                 {"requested_recovery_enabled", desired.recovery_threshold.has_value()},
+                 {"requested_recovery_threshold", desired.recovery_threshold.value_or(-1)}});
         desired.threshold = manual_threshold.value_or(desired.threshold);
         if (manual_threshold != previous_manual_threshold)
         {
@@ -267,12 +312,13 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         {{"manual_override_configured", manual_threshold.has_value()},
                          {"configured_threshold", desired.threshold}});
         }
-        if (desired.threshold != requested_policy.threshold ||
-            desired.early_emission != requested_policy.early_emission)
+        const bool primary_changed = desired.threshold != requested_policy.threshold ||
+            desired.early_emission != requested_policy.early_emission;
+        if (primary_changed || desired.recovery_request_id != requested_policy.recovery_request_id)
         {
-            pipeline->request_threshold(desired.threshold, desired.early_emission);
+            pipeline->request_policy(desired);
             requested_policy = desired;
-            logger.emit(DiagnosticSeverity::info, "threshold_requested", "inference",
+            if (primary_changed) logger.emit(DiagnosticSeverity::info, "threshold_requested", "inference",
                         "Threshold update queued for the next completed frame",
                         {{"threshold", desired.threshold},
                          {"early_emission", desired.early_emission},
@@ -381,12 +427,17 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
         "Starting integrated UART and TensorRT runtime",
         {
             {"model", manifest_.model_name},
+            {"prediction_mode", manifest_.prediction_mode},
+            {"prediction_delay_frames", manifest_.prediction_delay_frames},
+            {"frame_hz", manifest_.framer.raw_hz / static_cast<double>(manifest_.framer.frame_size_raw)},
             {"threshold", pipeline->active_threshold()},
             {"automatic_threshold", manifest_.threshold},
             {"manual_override_configured", manual_threshold.has_value()},
             {"early_emission", config_.early_emission},
             {"threshold_override_path", config_.threshold_override_path.string()},
             {"variant", manifest_.model_variant},
+            {"realtime_priority", static_cast<std::int64_t>(config_.scheduling.realtime_priority)},
+            {"require_realtime", config_.scheduling.require_realtime},
             {"queue_capacity", static_cast<std::uint64_t>(config_.queue_capacity)},
             {"replay", !config_.source.replay_path.empty()},
             {"uart_ecg1_offset", config_.uart_offsets.ecg1},
@@ -472,11 +523,17 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
         return true;
     };
 
+    std::atomic<unsigned> workers_configured{0};
+    auto setup_worker = [&](const char *name) {
+        configure_worker_scheduling(config_.scheduling, name, logger);
+        workers_configured.fetch_add(1, std::memory_order_release);
+    };
     std::thread output_thread(
         [&, owned_sink = std::move(output_sink)]() mutable
         {
             try
             {
+                setup_worker("dkfz-output");
                 RuntimeOutputRecord record;
                 while (true)
                 {
@@ -527,8 +584,10 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                 health.output_active_since_ns.store(
                     0, std::memory_order_release);
                 fail(
-                    IntegratedExitCode::output,
-                    "trigger_output_failed",
+                    dynamic_cast<const WorkerSchedulingError *>(&error)
+                        ? IntegratedExitCode::configuration : IntegratedExitCode::output,
+                    dynamic_cast<const WorkerSchedulingError *>(&error)
+                        ? "worker_scheduling_failed" : "trigger_output_failed",
                     "trigger_output",
                     error.what());
             }
@@ -540,6 +599,7 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
         {
             try
             {
+                setup_worker("dkfz-acquire");
                 std::uint64_t reported_malformed = 0;
                 std::uint64_t reported_discarded = 0;
                 std::uint64_t accepted_since_reset = 0;
@@ -658,6 +718,7 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         health.last_byte_ns.store(now, std::memory_order_relaxed);
                         health.bytes_read.fetch_add(
                             size, std::memory_order_relaxed);
+                        const auto decoded_before_chunk = health.samples_decoded.load(std::memory_order_relaxed);
                         decoder.process(bytes, size);
 
                         const auto &stats = decoder.stats();
@@ -676,6 +737,7 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                                 {
                                     {"malformed_groups", stats.malformed_groups},
                                     {"bytes_discarded", stats.bytes_discarded},
+                                    {"decoded_samples_before_chunk", decoded_before_chunk},
                                 });
                             reported_malformed = stats.malformed_groups;
                             reported_discarded = stats.bytes_discarded;
@@ -699,8 +761,10 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
             catch (const std::exception &error)
             {
                 fail(
-                    IntegratedExitCode::acquisition,
-                    "uart_acquisition_failed",
+                    dynamic_cast<const WorkerSchedulingError *>(&error)
+                        ? IntegratedExitCode::configuration : IntegratedExitCode::acquisition,
+                    dynamic_cast<const WorkerSchedulingError *>(&error)
+                        ? "worker_scheduling_failed" : "uart_acquisition_failed",
                     "uart",
                     error.what());
             }
@@ -713,8 +777,11 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
         {
             try
             {
+                setup_worker("dkfz-infer");
                 dkfz::uart::DecodedSample decoded;
                 std::uint64_t applied_reset_generation = 0;
+                std::uint64_t processing_since_evaluation_ns = 0, cpu_since_evaluation_ns = 0;
+                std::optional<std::uint64_t> previous_stream_epoch;
                 auto apply_pending_reset = [&]()
                 {
                     const auto generation = input_reset_generation.load(
@@ -724,6 +791,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         return false;
                     }
                     owned_pipeline->reset();
+                    processing_since_evaluation_ns = 0;
+                    cpu_since_evaluation_ns = 0;
                     applied_reset_generation = generation;
                     const auto reasons = input_reset_reasons.load(
                         std::memory_order_relaxed);
@@ -769,6 +838,18 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                     {
                         continue;
                     }
+                    if (manifest_.prediction_delay_frames && previous_stream_epoch &&
+                        *previous_stream_epoch != decoded.stream_epoch)
+                    {
+                        // Reset at the queued discontinuity, before consuming
+                        // its first sample. A decoder resync can otherwise look
+                        // contiguous on the reconstructed raw-sample axis.
+                        owned_pipeline->reset();
+                        processing_since_evaluation_ns = 0;
+                        cpu_since_evaluation_ns = 0;
+                        health.input_state_resets.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    previous_stream_epoch = decoded.stream_epoch;
                     health.queue_depth.store(
                         static_cast<std::uint64_t>(queue.size()),
                         std::memory_order_relaxed);
@@ -777,6 +858,7 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         started, std::memory_order_relaxed);
                     health.inference_active_since_ns.store(
                         started, std::memory_order_release);
+                    const auto cpu_started = config_.emit_probabilities ? thread_cpu_ns() : 0;
                     std::optional<InferenceResult> result;
                     try
                     {
@@ -791,6 +873,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         throw;
                     }
                     const auto completed = dkfz::uart::monotonic_clock_ns();
+                    processing_since_evaluation_ns += completed - started;
+                    if (config_.emit_probabilities) cpu_since_evaluation_ns += thread_cpu_ns() - cpu_started;
                     health.inference_active_since_ns.store(
                         0, std::memory_order_release);
                     health.samples_consumed.fetch_add(
@@ -804,7 +888,11 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         continue;
                     }
 
-                    const auto duration = completed - started;
+                    const auto duration = processing_since_evaluation_ns;
+                    const auto cpu_duration = cpu_since_evaluation_ns;
+                    processing_since_evaluation_ns = 0;
+                    cpu_since_evaluation_ns = 0;
+                    if (result->trigger) result->trigger->decision_monotonic_ns = completed;
                     health.last_inference_duration_ns.store(
                         duration, std::memory_order_relaxed);
                     update_atomic_max(health.max_inference_duration_ns, duration);
@@ -812,17 +900,47 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                         completed, std::memory_order_release);
                     health.frames_inferred.fetch_add(
                         1, std::memory_order_relaxed);
+                    const auto frame_delay = completed - decoded.decoded_monotonic_ns;
+                    const bool missed_deadline = static_cast<double>(frame_delay) >
+                        1e9 * static_cast<double>(manifest_.framer.frame_size_raw) / manifest_.framer.raw_hz;
+                    update_atomic_max(health.max_frame_end_to_completion_ns, frame_delay);
+                    if (missed_deadline) health.missed_frame_deadlines.fetch_add(1, std::memory_order_relaxed);
                     if (config_.emit_probabilities)
                     {
                         ProbabilityOutputRecord probability;
                         probability.sid = config_.sid;
                         probability.frame_idx = result->frame.frame_idx;
+                        probability.processing_duration_ns = duration;
+                        probability.window_assembly_ns = result->window_assembly_ns;
+                        probability.inference_ns = result->inference_ns;
+                        probability.trigger_ns = result->trigger_ns;
+                        probability.preprocessing_ns = duration - result->window_assembly_ns - result->inference_ns - result->trigger_ns;
+                        probability.cpu_thread_ns = cpu_duration;
+                        probability.sample_queue_wait_ns = started - decoded.decoded_monotonic_ns;
+                        probability.gpu_upload_ns = result->engine_timing.upload_ns;
+                        probability.gpu_compute_ns = result->engine_timing.compute_ns;
+                        probability.gpu_download_ns = result->engine_timing.download_ns;
+                        probability.cuda_graph = result->engine_timing.cuda_graph;
+                        probability.completed_monotonic_ns = completed;
+                        probability.decoded_monotonic_ns = decoded.decoded_monotonic_ns;
+                        probability.frame_end_to_completion_ns = frame_delay;
+                        probability.backlog_samples = queue.size();
+                        probability.missed_deadline = missed_deadline;
+                        if (result->observation_frame) {
+                            const auto &observed = *result->observation_frame;
+                            probability.observed_frame_idx = observed.frame_idx;
+                            probability.observed_start_sample_idx = observed.start_sample_idx;
+                            probability.observed_end_sample_idx = observed.end_sample_idx;
+                            probability.observed_time_ms = observed.end_time_ms;
+                        }
                         probability.start_sample_idx =
                             result->frame.start_sample_idx;
                         probability.end_sample_idx =
                             result->frame.end_sample_idx;
                         probability.time_ms = result->frame.end_time_ms;
                         probability.model_output = result->model_output;
+                        probability.recovery_probability = result->recovery_probability;
+                        probability.recovery_emitted_now = result->recovery_emitted_now;
                         probability.probability = result->probability;
                         probability.trigger_emitted_now =
                             result->trigger.has_value();
@@ -863,8 +981,10 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                 health.inference_active_since_ns.store(
                     0, std::memory_order_release);
                 fail(
-                    IntegratedExitCode::inference,
-                    "inference_failed",
+                    dynamic_cast<const WorkerSchedulingError *>(&error)
+                        ? IntegratedExitCode::configuration : IntegratedExitCode::inference,
+                    dynamic_cast<const WorkerSchedulingError *>(&error)
+                        ? "worker_scheduling_failed" : "inference_failed",
                     "inference",
                     error.what());
             }
@@ -872,7 +992,17 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
             health.inference_done.store(true, std::memory_order_release);
         });
 
-    notifier.ready("Integrated DKFZ UART/TensorRT runtime is running");
+    if (config_.scheduling.require_realtime)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (workers_configured.load(std::memory_order_acquire) < 3 && !failure.failed() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!failure.failed() && workers_configured.load(std::memory_order_acquire) < 3)
+            fail(IntegratedExitCode::configuration, "worker_scheduling_failed", "scheduling",
+                 "Timed out verifying the required worker scheduling profile");
+    }
+    if (!failure.failed()) notifier.ready("Integrated DKFZ UART/TensorRT runtime is running");
     auto next_status = health.started_ns + config_.status_interval_ns;
     auto next_threshold_poll = health.started_ns + 250'000'000ULL;
     bool status_input_paused = false;
@@ -969,6 +1099,18 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                     {"samples_decoded", samples_decoded},
                     {"samples_consumed", health.samples_consumed.load()},
                     {"frames_inferred", frames_inferred},
+                    {"prediction_mode", manifest_.prediction_mode},
+                    {"prediction_delay_frames", manifest_.prediction_delay_frames},
+                    {"recovery_api_version", std::uint64_t{1}},
+                    {"model_name", manifest_.model_name}, {"model_variant", manifest_.model_variant},
+                    {"engine_size_bytes", std::to_string(manifest_.engine_size_bytes.value_or(0))},
+                    {"engine_crc32", manifest_.engine_crc32.value_or("")},
+                    {"service_invocation_id", service_invocation},
+                    {"recovery_request_id", std::to_string(policy.recovery_request_id)},
+                    {"active_recovery_enabled", policy.recovery_threshold.has_value()},
+                    {"active_recovery_threshold", policy.recovery_threshold.value_or(-1)},
+                    {"requested_recovery_enabled", requested_policy.recovery_threshold.has_value()},
+                    {"requested_recovery_threshold", requested_policy.recovery_threshold.value_or(-1)},
                     {"threshold", policy.threshold},
                     {"manual_override_configured", manual_threshold.has_value()},
                     {"configured_threshold", requested_policy.threshold},
@@ -993,6 +1135,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
                      health.output_queue_high_water.load()},
                     {"malformed_groups", health.malformed_groups.load()},
                     {"bytes_discarded", health.bytes_discarded.load()},
+                    {"missed_frame_deadlines", health.missed_frame_deadlines.load()},
+                    {"max_frame_end_to_completion_ns", health.max_frame_end_to_completion_ns.load()},
                     {"last_inference_duration_ns",
                      health.last_inference_duration_ns.load()},
                     {"max_inference_duration_ns",
@@ -1039,6 +1183,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
     summary.trigger_events = health.trigger_events.load();
     summary.malformed_groups = health.malformed_groups.load();
     summary.bytes_discarded = health.bytes_discarded.load();
+    summary.missed_frame_deadlines = health.missed_frame_deadlines.load();
+    summary.max_frame_end_to_completion_ns = health.max_frame_end_to_completion_ns.load();
     summary.max_inference_duration_ns =
         health.max_inference_duration_ns.load();
     summary.queue_high_water = static_cast<std::size_t>(
@@ -1061,6 +1207,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
             : "Integrated runtime stopped after a fatal error",
         {
             {"exit_code", static_cast<std::int64_t>(summary.exit_code)},
+            {"malformed_groups", summary.malformed_groups},
+            {"bytes_discarded", summary.bytes_discarded},
             {"bytes_read", summary.bytes_read},
             {"samples_decoded", summary.samples_decoded},
             {"samples_consumed", summary.samples_consumed},
@@ -1076,6 +1224,8 @@ IntegratedRuntimeSummary IntegratedLiveRuntime::run(
             {"queue_high_water",
              static_cast<std::uint64_t>(summary.queue_high_water)},
             {"max_inference_duration_ns", summary.max_inference_duration_ns},
+            {"missed_frame_deadlines", summary.missed_frame_deadlines},
+            {"max_frame_end_to_completion_ns", summary.max_frame_end_to_completion_ns},
         });
     notifier.stopping(
         summary.exit_code == IntegratedExitCode::success

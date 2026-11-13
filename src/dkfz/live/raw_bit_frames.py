@@ -482,6 +482,7 @@ def convert_gpio_edges_to_parquet(
                 b"uart_ecg2_offset": str(float(ecg2_offset)).encode(),
                 b"uart_puls_offset": str(float(puls_offset)).encode(),
                 b"format": b"gpio-pin29-samples-v1",
+                b"auxiliary_publication": b"following-group",
             }
         )
         pq.write_table(

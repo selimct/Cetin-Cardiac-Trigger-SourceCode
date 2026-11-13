@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from dkfz.live.artifact_discovery import published_model_directory
 
 DEFAULT_MODEL_VARIANT = "best"
 
@@ -32,11 +33,18 @@ class ModelVariant:
         """Return one explicit artifact root, or the conventional default."""
         if model_dir is not None:
             return Path(model_dir)
-        return Path("models") / str(modelname)
+        default = Path("models") / str(modelname)
+        published = published_model_directory(str(modelname))
+        if (
+            not (default / self.config).is_file()
+            and published != Path("finished_models") / str(modelname)
+            and (published / self.config).is_file()
+            and (published / self.checkpoint).is_file()
+        ):
+            return published
+        return default
 
-    def config_path(
-        self, modelname: str, model_dir: str | Path | None = None
-    ) -> Path:
+    def config_path(self, modelname: str, model_dir: str | Path | None = None) -> Path:
         return self.model_dir(modelname, model_dir) / self.config
 
     def checkpoint_path(
@@ -44,9 +52,7 @@ class ModelVariant:
     ) -> Path:
         return self.model_dir(modelname, model_dir) / self.checkpoint
 
-    def onnx_path(
-        self, modelname: str, model_dir: str | Path | None = None
-    ) -> Path:
+    def onnx_path(self, modelname: str, model_dir: str | Path | None = None) -> Path:
         filename = f"{modelname}{self.onnx_suffix}.onnx"
         return self.model_dir(modelname, model_dir) / filename
 
@@ -93,12 +99,11 @@ def require_model_artifact_path(
     *,
     modelname: str,
     model_dir: str | Path | None = None,
+    model_variant: str | None = None,
     label: str = "artifact",
 ) -> Path:
     """Require an artifact path to belong to one explicit model root."""
-    root = (
-        Path(model_dir) if model_dir is not None else Path("models") / str(modelname)
-    ).resolve()
+    root = get_model_variant(model_variant).model_dir(modelname, model_dir).resolve()
     candidate = Path(path)
     resolved = candidate.resolve()
     if resolved != root and not resolved.is_relative_to(root):

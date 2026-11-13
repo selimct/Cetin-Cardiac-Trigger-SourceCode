@@ -31,16 +31,39 @@ class LiveStreamingPredictor:
         window_size: int,
         threshold: float,
         holdoff_frames: int,
+        recovery_head: bool = False,
+        recovery_threshold: float | None = None,
+        prediction_delay_frames: int = 0,
         framer: LiveFeatureFramer | None = None,
         **framer_kwargs,
     ):
+        self.prediction_delay_frames = int(prediction_delay_frames)
+        if prediction_delay_frames not in (0, 1) or isinstance(
+            prediction_delay_frames, bool
+        ):
+            raise ValueError("prediction_delay_frames must be 0 or 1")
+        if prediction_delay_frames and (recovery_head or int(window_size) < 2):
+            raise ValueError(
+                "A delayed primary needs window_size >= 2 and no recovery head"
+            )
         self.window_size = int(window_size)
         self.threshold = float(threshold)
         self.holdoff_frames = int(holdoff_frames)
+        self.recovery_head = bool(recovery_head)
+        if self.recovery_head and self.window_size < 2:
+            raise ValueError("recovery_head requires window_size >= 2")
+        self.recovery_threshold = recovery_threshold
+        if recovery_threshold is not None and not self.recovery_head:
+            raise ValueError("recovery_threshold requires recovery_head=True")
         self.framer = framer or LiveFeatureFramer(**framer_kwargs)
+        if self.prediction_delay_frames and (
+            self.framer.raw_hz != 400 or self.framer.frame_size_raw != 4
+        ):
+            raise ValueError("A delayed primary requires 400 Hz and four-sample frames")
         self.trigger_logic = StreamingHoldoffLocalMaxTrigger(
             threshold=self.threshold,
             holdoff_frames=self.holdoff_frames,
+            recovery_threshold=recovery_threshold,
         )
         self.reset()
 
@@ -55,8 +78,15 @@ class LiveStreamingPredictor:
         self.trigger_logic.reset()
         self._feature_window: deque[np.ndarray] = deque(maxlen=self.window_size)
         self.last_probability: float | None = None
+        self.last_recovery_probability: float | None = None
         self.last_probability_updated = False
         self.last_frame: LiveFeatureFrame | None = None
+        self.last_input_frame: LiveFeatureFrame | None = None
+        self._target_frames = deque(maxlen=self.prediction_delay_frames + 1)
+        self._previous_raw_idx = None
+        self._previous_sid = None
+        self._next_raw_idx = 0
+        self._last_raw_time = None
 
     def _run_model_on_current_window(self) -> float:
         """Return the probability for the current feature window."""
@@ -73,6 +103,27 @@ class LiveStreamingPredictor:
         ecg3: float | None = None,
     ) -> TriggerEvent | None:
         """Process one raw sample through framing, inference, and triggering."""
+        if self.prediction_delay_frames:
+            if self._previous_sid is not None and sid != self._previous_sid:
+                self.reset()
+            sample_idx_400hz = (
+                self._next_raw_idx
+                if sample_idx_400hz is None
+                else int(sample_idx_400hz)
+            )
+            if self._previous_sid is not None and (
+                sid != self._previous_sid
+                or sample_idx_400hz != self._previous_raw_idx + 1
+            ):
+                self.reset()
+            self._previous_raw_idx = sample_idx_400hz
+            self._previous_sid = sid
+            self._next_raw_idx = sample_idx_400hz + 1
+            self._last_raw_time = (
+                time_ms
+                if time_ms is not None
+                else sample_idx_400hz / self.framer.raw_hz * 1000
+            )
         self.last_probability_updated = False
         frame = self.framer.process_sample(
             ecg1=ecg1,
@@ -85,8 +136,10 @@ class LiveStreamingPredictor:
         if frame is None:
             return None
 
-        self.last_frame = frame
+        self.last_input_frame = frame
+        self._target_frames.append(frame)
         self._feature_window.append(frame.features)
+        self.last_frame = self._target_frames[0]
         if len(self._feature_window) < self.window_size:
             self.last_probability = None
             return None
@@ -100,6 +153,16 @@ class LiveStreamingPredictor:
             current_sample_idx_400hz=frame.end_sample_idx_400hz,
             current_time_ms=frame.end_time_ms,
             sid=sid,
+            recovery_probability=self.last_recovery_probability,
+            **(
+                dict(
+                    target_frame_idx=self.last_frame.frame_idx_50hz,
+                    target_sample_idx=self.last_frame.end_sample_idx_400hz,
+                    target_time_ms=self.last_frame.end_time_ms,
+                )
+                if self.prediction_delay_frames
+                else {}
+            ),
         )
 
     def flush(self, sid: int | str = 0) -> TriggerEvent | None:
@@ -107,9 +170,19 @@ class LiveStreamingPredictor:
         if self.last_frame is None:
             return None
         return self.trigger_logic.flush(
-            current_frame_idx_50hz=self.last_frame.frame_idx_50hz,
-            current_sample_idx_400hz=self.last_frame.end_sample_idx_400hz,
-            current_time_ms=self.last_frame.end_time_ms,
+            current_frame_idx_50hz=(
+                self.last_input_frame or self.last_frame
+            ).frame_idx_50hz,
+            current_sample_idx_400hz=(
+                self._previous_raw_idx
+                if self.prediction_delay_frames
+                else self.last_frame.end_sample_idx_400hz
+            ),
+            current_time_ms=(
+                self._last_raw_time
+                if self.prediction_delay_frames
+                else self.last_frame.end_time_ms
+            ),
             sid=sid,
         )
 
@@ -179,7 +252,11 @@ class LiveStreamingPredictor:
         for i in range(len(ecg1)):
             time_i_ms = None if times_ms is None else float(times_ms[i])
             puls_i = None if puls is None else float(puls[i])
-            sample_idx = i if sample_idxs is None else int(sample_idxs[i])
+            sample_idx = (
+                (None if self.prediction_delay_frames else i)
+                if sample_idxs is None
+                else int(sample_idxs[i])
+            )
             event = self.process_sample(
                 ecg1=float(ecg1[i]),
                 ecg2=float(ecg2[i]),
@@ -205,6 +282,24 @@ class LiveStreamingPredictor:
                     "trigger_emitted_now": event is not None,
                     "feature_dim": int(len(self.last_frame.features)),
                 }
+                if self.prediction_delay_frames:
+                    row.update(
+                        prediction_delay_frames=self.prediction_delay_frames,
+                        observed_frame_idx=self.last_input_frame.frame_idx_50hz,
+                        observed_raw_idx=self.last_input_frame.start_sample_idx_400hz,
+                        observed_raw_frame_end_idx=self.last_input_frame.end_sample_idx_400hz,
+                        observed_time_ms=self.last_input_frame.end_time_ms,
+                        raw_frame_end_idx=self.last_frame.end_sample_idx_400hz,
+                        selected_peak_raw_idx=(
+                            None if event is None else event.peak_sample_idx_400hz
+                        ),
+                        emitted_on_raw_idx=(
+                            None if event is None else event.emitted_on_sample_idx_400hz
+                        ),
+                        emitted_on_time_ms=(
+                            None if event is None else event.emitted_on_time_ms
+                        ),
+                    )
                 row.update(
                     {
                         col: float(val)
@@ -214,6 +309,11 @@ class LiveStreamingPredictor:
                         )
                     }
                 )
+                if self.recovery_head:
+                    row["recovery_prob"] = self.last_recovery_probability
+                    row["recovery_emitted_now"] = (
+                        self.trigger_logic.last_event_was_recovery
+                    )
                 logs.append(row)
 
             if event is not None:
@@ -282,9 +382,7 @@ class LiveStreamingPredictor:
                 ecg1=group[ecg1_col].to_numpy(dtype=float),
                 ecg2=group[ecg2_col].to_numpy(dtype=float),
                 ecg3=(
-                    None
-                    if ecg3_col is None
-                    else group[ecg3_col].to_numpy(dtype=float)
+                    None if ecg3_col is None else group[ecg3_col].to_numpy(dtype=float)
                 ),
                 puls=puls,
                 times_ms=times_ms,

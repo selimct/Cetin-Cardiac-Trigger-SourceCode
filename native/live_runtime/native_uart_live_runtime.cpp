@@ -238,6 +238,14 @@ void apply_config_value(
     {
         options.runtime.input_reset.recovery_ms = parse_unsigned(value, key);
     }
+    else if (key == "realtime_priority")
+    {
+        options.runtime.scheduling.realtime_priority = parse_unsigned_as<int>(value, key);
+    }
+    else if (key == "require_realtime")
+    {
+        options.runtime.scheduling.require_realtime = parse_bool(value, key);
+    }
     else if (key == "emit_probabilities")
     {
         options.runtime.emit_probabilities = parse_bool(value, key);
@@ -414,6 +422,9 @@ void print_help(const char *program)
         << "  --inference-timeout-ms N\n"
         << "  --output-timeout-ms N\n"
         << "  --disable-watchdog           disable internal deadlines\n"
+        << "  --realtime-priority N        worker SCHED_RR priority 1..20; 0 inherits (default)\n"
+        << "  --require-realtime           fail if bounded worker RT scheduling is unavailable\n"
+        << "  --no-require-realtime        report optional RT failure and continue\n"
         << "  --emit-probabilities         JSONL parity/debug frame records\n"
         << "  --sid VALUE                  fixed stream identifier\n"
         << "  --validate-only              validate config without running\n"
@@ -469,6 +480,14 @@ Options parse_args(int argc, char **argv)
         else if (option == "--early-emission" || option == "--no-early-emission")
         {
             options.runtime.early_emission = option == "--early-emission";
+        }
+        else if (option == "--realtime-priority")
+        {
+            options.runtime.scheduling.realtime_priority = parse_unsigned_as<int>(require_value(index, option), option);
+        }
+        else if (option == "--require-realtime" || option == "--no-require-realtime")
+        {
+            options.runtime.scheduling.require_realtime = option == "--require-realtime";
         }
         else if (option == "--device")
         {
@@ -734,7 +753,7 @@ void validate_integrated_compatibility(
 }
 
 std::unique_ptr<dkfz::live::LogitEngine> make_engine(
-    const dkfz::live::DeploymentManifest &manifest)
+    const dkfz::live::DeploymentManifest &manifest, bool profile = false)
 {
     dkfz::live::verify_deployment_engine_fingerprint(manifest);
     return dkfz::live::make_tensorrt_logit_engine(
@@ -742,7 +761,7 @@ std::unique_ptr<dkfz::live::LogitEngine> make_engine(
         manifest.input_tensor,
         manifest.output_tensor,
         manifest.window_size,
-        manifest.input_dim);
+        manifest.input_dim, profile);
 }
 
 } // namespace
@@ -756,6 +775,7 @@ int main(int argc, char **argv)
         const auto manifest = dkfz::live::load_deployment_manifest(
             options.manifest_path);
         validate_integrated_compatibility(options, manifest);
+        dkfz::live::check_required_realtime_limit(options.runtime.scheduling);
         if (options.validate_only)
         {
             if (options.check_engine)
@@ -771,6 +791,8 @@ int main(int argc, char **argv)
                     {"model", manifest.model_name},
                     {"manifest", options.manifest_path.string()},
                     {"engine_checked", options.check_engine},
+                    {"realtime_priority", static_cast<std::int64_t>(options.runtime.scheduling.realtime_priority)},
+                    {"require_realtime", options.runtime.scheduling.require_realtime},
                     {"output_mode", dkfz::live::runtime_output_mode_name(
                          options.runtime.output.mode)},
                 });
@@ -780,7 +802,7 @@ int main(int argc, char **argv)
         std::unique_ptr<dkfz::live::LogitEngine> engine;
         try
         {
-            engine = make_engine(manifest);
+            engine = make_engine(manifest, options.runtime.emit_probabilities);
         }
         catch (const std::exception &error)
         {

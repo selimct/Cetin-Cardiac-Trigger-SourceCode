@@ -8,7 +8,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${repo_root}/build_native"
 venv_dir="${repo_root}/.venv"
-run_tests=0
 rebuild_python_extension=0
 targets=()
 
@@ -24,13 +23,13 @@ Options:
   --target TARGET       Build only this CMake target. Repeatable.
   --python-extension    Also rebuild the dkfz.native._live_core extension.
   --venv DIR            Python environment used with --python-extension.
-  --test                Run the native CTest suite after rebuilding.
+  --test                Compatibility flag; development tests are not bundled.
   --help                Show this help.
 
 Examples:
   bash run/rebuild_native.sh
   bash run/rebuild_native.sh --target native_uart_live_runtime
-  bash run/rebuild_native.sh --python-extension --test
+  bash run/rebuild_native.sh --python-extension
 USAGE
 }
 
@@ -56,7 +55,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --test)
-            run_tests=1
+            echo "Development tests are not bundled in the public distribution." >&2
             shift
             ;;
         --help|-h)
@@ -95,10 +94,6 @@ if [[ "${rebuild_python_extension}" -eq 1 ]]; then
         --editable "${repo_root}"
     "${venv_python}" -c \
         'from dkfz.live import feature_backend_name; print("Python feature backend:", feature_backend_name())'
-fi
-
-if [[ "${run_tests}" -eq 1 ]]; then
-    ctest --test-dir "${build_dir}" --output-on-failure
 fi
 
 printf 'Incremental native rebuild complete: %s\n' "${build_dir}"

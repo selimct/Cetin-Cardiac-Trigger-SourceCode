@@ -22,9 +22,10 @@ from dkfz.live.feature_framing import (
     fit_apply_signal_quality_feature,
 )
 from dkfz.live.io import repo_relative_path, resolve_input_paths
+from dkfz.live.training_plots import training_plots_enabled
 from dkfz.live.event_matching import (
     outer_association_frames,
-    EXACT_TOLERANCE_FRAMES,
+    tp_tolerance_frames,
     METRICS_SCHEMA_VERSION,
 )
 from dkfz.live.triggers import trigger_backend_name
@@ -95,6 +96,9 @@ _TRAINING_CONFIG_SECTIONS = (
             "hidden_dim",
             "num_layers",
             "window_size",
+            "prediction_mode",
+            "prediction_delay_frames",
+            "recovery_head",
             "include_puls",
         ),
     ),
@@ -107,6 +111,7 @@ _TRAINING_CONFIG_SECTIONS = (
             "seed",
             "test_size",
             "use_amp",
+            "plots",
         ),
     ),
     (
@@ -120,6 +125,8 @@ _TRAINING_CONFIG_SECTIONS = (
             "ecg_slope_mode",
             "ecg_slope_slow_window_samples",
             "signal_quality_mode",
+            "signal_quality_puls_flat_window_frames",
+            "signal_quality_puls_median_window_frames",
             "ecg_rotation_angle",
             "puls_quantile_low",
             "puls_quantile_high",
@@ -266,9 +273,14 @@ def format_resolved_training_configuration(
                 details.append("derived")
 
             suffix = f"  ({', '.join(details)})" if details else ""
+            display_value = (
+                f"auto ({'on' if training_plots_enabled() else 'off'})"
+                if key == "plots" and all_values[key] is None
+                else _short_value(all_values[key], is_path=key in _TRAINING_PATH_KEYS)
+            )
             section_lines.append(
                 f"  {key:<{key_width}} = "
-                f"{_short_value(all_values[key], is_path=key in _TRAINING_PATH_KEYS)}"
+                f"{display_value}"
                 f"{suffix}"
             )
 
@@ -384,7 +396,7 @@ def load_or_build_training_frames(
                 f"overlap: {display}"
             )
         timing.mark("resolved input paths")
-        frame_dfs = load_prepped_training_frame_dfs(prepped_file)
+        frame_dfs = load_prepped_training_frame_dfs(prepped_file, settings=kwargs)
         _validate_prepped_input_roles(
             frame_dfs,
             input_paths=input_paths,
@@ -449,7 +461,7 @@ def load_or_build_training_frames(
         kwargs["signal_quality_stats"] = signal_quality_stats
         timing.mark("fit/applied signal quality calibration")
     if kwargs["save_prepped"]:
-        save_prepped_training_frame_dfs(frame_dfs, prepped_file)
+        save_prepped_training_frame_dfs(frame_dfs, prepped_file, settings=kwargs)
         timing.mark("saved preprocessed training frames")
     return frame_dfs, input_paths, threshold_input_paths
 
@@ -484,6 +496,13 @@ def training_frame_build_kwargs(
         ),
         signal_quality_mode=signal_quality_mode,
         signal_quality_stats=signal_quality_stats,
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
+        signal_quality_puls_flat_window_frames=int(
+            kwargs.get("signal_quality_puls_flat_window_frames", 10)
+        ),
+        signal_quality_puls_median_window_frames=int(
+            kwargs.get("signal_quality_puls_median_window_frames", 200)
+        ),
         ecg_rotation_angle=float(kwargs["ecg_rotation_angle"]),
         puls_offset=float(kwargs["puls_offset"]),
         puls_quantile_low=float(kwargs["puls_quantile_low"]),
@@ -526,6 +545,8 @@ def build_training_loaders(
     window_size: int,
     batch_size: int,
     timing,
+    recovery_head: bool = False,
+    prediction_delay_frames: int = 0,
 ) -> tuple[SlidingWindowDataset, SlidingWindowDataset, DataLoader, DataLoader]:
     train_data, val_data = separate_framed_train_val(frame_dfs)
     timing.mark("separated train and validation frames")
@@ -534,12 +555,16 @@ def build_training_loaders(
         feature_cols=feature_cols,
         target_col=target_col,
         window_size=window_size,
+        recovery_head=recovery_head,
+        prediction_delay_frames=prediction_delay_frames,
     )
     val_dataset = SlidingWindowDataset(
         val_data,
         feature_cols=feature_cols,
         target_col=target_col,
         window_size=window_size,
+        recovery_head=recovery_head,
+        prediction_delay_frames=prediction_delay_frames,
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -554,15 +579,23 @@ def build_ecg_rnn(
     num_layers: int,
     device: torch.device | None = None,
     checkpoint_path: str | Path | None = None,
+    recovery_head: bool = False,
+    prediction_delay_frames: int = 0,
+    initialize_recovery: bool = False,
 ) -> ECG_RNN:
     device = device or default_torch_device()
     model = ECG_RNN(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
+        recovery_head=recovery_head,
+        prediction_delay_frames=prediction_delay_frames,
     ).to(device)
     if checkpoint_path is not None:
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        model.load_checkpoint(
+            torch.load(checkpoint_path, map_location=device, weights_only=True),
+            initialize_recovery=initialize_recovery,
+        )
     return model
 
 
@@ -589,6 +622,10 @@ def evaluate_and_write_live_artifacts(
     metrics_dir: Path | None = None,
     metrics_prefix: str | None = None,
     raw_hz: float = 400.0,
+    recovery_max_fp_increase: float = 0.10,
+    recovery_min_extra_fp_per_minute: float = 0.5,
+    primary_policy: dict | None = None,
+    plots: bool | None = None,
 ) -> ThresholdSelection:
     threshold_search_df, threshold_selection = eval_torch(
         model,
@@ -601,6 +638,10 @@ def evaluate_and_write_live_artifacts(
         use_amp=use_amp,
         return_threshold_selection=True,
         outer_error_association_frames=outer_association_frames(raw_hz, frame_size_raw),
+        recovery_max_fp_increase=recovery_max_fp_increase,
+        recovery_min_extra_fp_per_minute=recovery_min_extra_fp_per_minute,
+        frame_hz=raw_hz / frame_size_raw,
+        primary_policy=primary_policy,
     )
     best_threshold = threshold_selection.threshold
     selected_metrics = threshold_selection.metrics
@@ -639,6 +680,7 @@ def evaluate_and_write_live_artifacts(
         target_col=target_col,
         device=device,
         use_amp=use_amp,
+        recovery_threshold=threshold_selection.recovery_threshold,
     )
     timing.mark(outputs_label)
     write_live_eval_artifacts(
@@ -654,9 +696,23 @@ def evaluate_and_write_live_artifacts(
         metrics_dir=metrics_dir,
         metrics_prefix=metrics_prefix,
         threshold_selection=threshold_selection,
+        plots=plots,
+        exact_tolerance_frames=tp_tolerance_frames(raw_hz / frame_size_raw),
         outer_error_association_frames=outer_association_frames(raw_hz, frame_size_raw),
     )
     timing.mark(artifacts_label)
+    if "recovery_threshold_search" in threshold_search_df.attrs:
+        directory = metrics_dir or model_dir / "metrics"
+        directory.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(threshold_search_df.attrs["recovery_threshold_search"]).to_csv(
+            directory / f"{metrics_prefix or prefix}_recovery_threshold_search.csv",
+            index=False,
+        )
+        print(
+            f"Recovery threshold: {threshold_selection.recovery_threshold}; "
+            f"validation extra-FP allowance: max({recovery_max_fp_increase:.0%} of baseline, "
+            f"{recovery_min_extra_fp_per_minute:g}/minute); requires fewer FN and FP+FN"
+        )
     return threshold_selection
 
 
@@ -683,6 +739,31 @@ def base_training_metadata(
         "hidden_dim": int(kwargs["hidden_dim"]),
         "num_layers": int(kwargs["num_layers"]),
         "window_size": int(kwargs["window_size"]),
+        "prediction_mode": kwargs.get("prediction_mode", "current"),
+        "prediction_delay_frames": int(kwargs.get("prediction_delay_frames", 0)),
+        "frame_hz": float(kwargs["raw_hz"]) / int(kwargs["frame_size_raw"]),
+        "signal_quality_puls_flat_window_frames": int(
+            kwargs.get("signal_quality_puls_flat_window_frames", 10)
+        ),
+        "signal_quality_puls_median_window_frames": int(
+            kwargs.get("signal_quality_puls_median_window_frames", 200)
+        ),
+        "recovery_head": bool(kwargs.get("recovery_head", False)),
+        "recovery_only": bool(kwargs.get("recovery_only", False)),
+        "cache_frozen_recovery": bool(kwargs.get("cache_frozen_recovery", True)),
+        **(
+            {"recovery_validation_log": kwargs["_recovery_validation_log"]}
+            if kwargs.get("_recovery_validation_log")
+            else {}
+        ),
+        **(
+            {
+                "output_heads": ["current", "previous"],
+                "recovery_target_offset_frames": -1,
+            }
+            if kwargs.get("recovery_head")
+            else {}
+        ),
         "lr": float(kwargs["lr"]),
         "num_epochs": int(kwargs["num_epochs"]),
         "batch_size": int(kwargs["batch_size"]),
@@ -693,7 +774,12 @@ def base_training_metadata(
         "threshold": float(best_threshold),
         **threshold_selection.policy_metadata(),
         "manual_threshold": kwargs.get("manual_threshold"),
-        "outer_error_association_ms": 40.0,
+        "outer_error_association_ms": outer_association_frames(
+            kwargs["raw_hz"], kwargs["frame_size_raw"]
+        )
+        * float(kwargs["frame_size_raw"])
+        / float(kwargs["raw_hz"])
+        * 1000,
         "outer_error_association_frames": outer_association_frames(
             kwargs["raw_hz"], kwargs["frame_size_raw"]
         ),
@@ -713,7 +799,9 @@ def base_training_metadata(
         },
         "holdoff_frames": int(kwargs["min_distance"]),
         "min_distance": int(kwargs["min_distance"]),
-        "exact_tolerance_frames": EXACT_TOLERANCE_FRAMES,
+        "exact_tolerance_frames": tp_tolerance_frames(
+            float(kwargs["raw_hz"]) / int(kwargs["frame_size_raw"])
+        ),
         "error_association_frames": int(kwargs["error_association_frames"]),
         "save_last": bool(kwargs["save_last"]),
         "raw_hz": float(kwargs["raw_hz"]),
@@ -750,6 +838,8 @@ def base_training_metadata(
         "time_col": kwargs["time_col"],
         "time_unit": kwargs["time_unit"],
         "use_amp": bool(kwargs["use_amp"]),
+        "plots": kwargs.get("plots"),
+        "plots_enabled": training_plots_enabled(kwargs.get("plots")),
         "use_prepped": bool(kwargs["use_prepped"]),
         "save_prepped": bool(kwargs["save_prepped"]),
         "prep_workers": int(kwargs.get("prep_workers", 1)),

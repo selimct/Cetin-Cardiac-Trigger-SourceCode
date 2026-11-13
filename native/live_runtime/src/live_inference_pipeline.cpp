@@ -8,13 +8,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 
 namespace dkfz::live
 {
 
-static_assert(std::atomic<double>::is_always_lock_free,
+static_assert(std::atomic<double>::is_always_lock_free && std::atomic<std::uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free,
               "Live threshold control requires lock-free double atomics");
 
 LiveInferencePipeline::LiveInferencePipeline(
@@ -25,11 +26,15 @@ LiveInferencePipeline::LiveInferencePipeline(
       engine_(std::move(engine)),
       framer_(manifest_.framer),
       trigger_(manifest_.manual_threshold.value_or(manifest_.threshold), manifest_.holdoff_frames),
-      active_policy_(encode_policy(manifest_.manual_threshold.value_or(manifest_.threshold), early_emission)),
-      pending_policy_(std::numeric_limits<double>::quiet_NaN())
+      applied_policy_{manifest_.manual_threshold.value_or(manifest_.threshold), early_emission,
+                      manifest_.recovery_threshold, 0},
+      desired_policy_(applied_policy_)
 {
+    contiguous_.reserve(manifest_.window_size * manifest_.input_dim);
     validate_deployment_manifest(manifest_);
-    const auto threshold = active_threshold();
+    trigger_.set_recovery_threshold(manifest_.recovery_threshold);
+    active_mailbox_.store(applied_policy_);
+    const auto threshold = applied_policy_.threshold;
     trigger_.set_thresholds(threshold, early_emission
         ? std::max(threshold, manifest_.emission_reference_threshold()) : threshold);
     if (!engine_)
@@ -45,27 +50,69 @@ LiveInferencePipeline::LiveInferencePipeline(
 
 void LiveInferencePipeline::request_threshold(double threshold)
 {
-    request_threshold(threshold, active_policy().early_emission);
+    std::lock_guard<std::mutex> guard(request_mutex_);
+    auto policy = desired_policy_;
+    policy.threshold = threshold;
+    enqueue_policy(policy);
 }
 
-double LiveInferencePipeline::encode_policy(double threshold, bool early_emission)
+void PolicyMailbox::store(const TriggerPolicy &policy) noexcept
 {
-    return std::copysign(threshold, early_emission ? 1.0 : -1.0);
+    sequence.fetch_add(1);
+    threshold.store(policy.threshold);
+    early.store(policy.early_emission);
+    recovery.store(policy.recovery_threshold.value_or(-1));
+    request_id.store(policy.recovery_request_id);
+    sequence.fetch_add(1);
+}
+
+bool PolicyMailbox::load(TriggerPolicy &policy, std::uint64_t &version) const noexcept
+{
+    const auto before = sequence.load();
+    if (before & 1U) return false;
+    policy.threshold = threshold.load();
+    policy.early_emission = early.load();
+    const auto value = recovery.load();
+    policy.recovery_threshold = value < 0 ? std::nullopt : std::optional<double>(value);
+    policy.recovery_request_id = request_id.load();
+    version = sequence.load();
+    return before == version;
 }
 
 TriggerPolicy LiveInferencePipeline::active_policy() const noexcept
 {
-    const auto encoded = active_policy_.load();
-    return {std::abs(encoded), !std::signbit(encoded)};
+    TriggerPolicy policy{};
+    std::uint64_t version{};
+    // Readback runs on the supervisor, never the inference thread.
+    while (!active_mailbox_.load(policy, version)) {}
+    return policy;
+}
+
+void LiveInferencePipeline::request_policy(const TriggerPolicy &policy)
+{
+    std::lock_guard<std::mutex> guard(request_mutex_);
+    enqueue_policy(policy);
+}
+
+void LiveInferencePipeline::enqueue_policy(const TriggerPolicy &policy)
+{
+    if (!std::isfinite(policy.threshold) || policy.threshold < 0 || policy.threshold > 1)
+        throw std::invalid_argument("Threshold must be finite and within [0, 1]");
+    if (policy.recovery_threshold && (manifest_.prediction_delay_frames || !manifest_.recovery_head ||
+        !std::isfinite(*policy.recovery_threshold) || *policy.recovery_threshold <= 0 ||
+        *policy.recovery_threshold > 1))
+        throw std::invalid_argument("Recovery requires two outputs and a threshold in (0, 1]");
+    desired_policy_ = policy;
+    pending_mailbox_.store(policy);
 }
 
 void LiveInferencePipeline::request_threshold(double threshold, bool early_emission)
 {
-    if (!std::isfinite(threshold) || threshold < 0.0 || threshold > 1.0)
-    {
-        throw std::invalid_argument("Threshold must be finite and within [0, 1]");
-    }
-    pending_policy_.store(encode_policy(threshold, early_emission));
+    std::lock_guard<std::mutex> guard(request_mutex_);
+    auto policy = desired_policy_;
+    policy.threshold = threshold;
+    policy.early_emission = early_emission;
+    enqueue_policy(policy);
 }
 
 void LiveInferencePipeline::reset()
@@ -74,6 +121,10 @@ void LiveInferencePipeline::reset()
     trigger_.reset();
     feature_window_.clear();
     last_frame_.reset();
+    target_frames_.clear();
+    previous_raw_idx_.reset();
+    previous_raw_time_.reset();
+    previous_sid_.reset();
 }
 
 float LiveInferencePipeline::sigmoid(float value)
@@ -91,24 +142,41 @@ std::optional<InferenceResult> LiveInferencePipeline::process_sample(
     const RawSample &sample,
     const std::string &sid)
 {
-    auto frame = framer_.process_sample(sample);
+    if (manifest_.prediction_delay_frames && previous_sid_ && *previous_sid_ != sid) reset();
+    const auto raw_idx = sample.sample_idx.value_or(previous_raw_idx_.value_or(-1) + 1);
+    if (manifest_.prediction_delay_frames && previous_sid_ &&
+        (*previous_sid_ != sid || raw_idx != *previous_raw_idx_ + 1)) reset();
+    previous_raw_idx_ = raw_idx;
+    previous_raw_time_ = sample.time_ms.value_or(static_cast<double>(raw_idx) / manifest_.framer.raw_hz * 1000);
+    previous_sid_ = sid;
+    auto effective_sample = sample;
+    if (manifest_.prediction_delay_frames) effective_sample.sample_idx = raw_idx;
+    auto frame = framer_.process_sample(effective_sample);
     if (!frame.has_value())
     {
         return std::nullopt;
     }
-    // Unchanged frames need only a read, without cache-line ownership traffic
-    // from an atomic read-modify-write on every frame.
-    if (std::isfinite(pending_policy_.load(std::memory_order_relaxed)))
+    TriggerPolicy requested{};
+    std::uint64_t version{};
+    if (pending_mailbox_.load(requested, version) && version != applied_version_)
     {
-        const auto requested = pending_policy_.exchange(
-            std::numeric_limits<double>::quiet_NaN());
-        const auto threshold = std::abs(requested);
-        const auto emission_threshold = std::signbit(requested)
-            ? threshold : std::max(threshold, manifest_.emission_reference_threshold());
-        trigger_.set_thresholds(threshold, emission_threshold);
-        active_policy_.store(requested);
+        if (requested.threshold != applied_policy_.threshold ||
+            requested.early_emission != applied_policy_.early_emission)
+        {
+            trigger_.set_thresholds(requested.threshold, requested.early_emission
+                ? std::max(requested.threshold, manifest_.emission_reference_threshold())
+                : requested.threshold);
+        }
+        if (requested.recovery_threshold != applied_policy_.recovery_threshold)
+            trigger_.set_recovery_threshold(requested.recovery_threshold);
+        applied_policy_ = requested;
+        applied_version_ = version;
+        active_mailbox_.store(applied_policy_);
     }
     last_frame_ = *frame;
+    target_frames_.push_back(*frame);
+    if (target_frames_.size() > static_cast<std::size_t>(manifest_.prediction_delay_frames + 1))
+        target_frames_.pop_front();
     feature_window_.push_back(frame->features);
     if (feature_window_.size() > manifest_.window_size)
     {
@@ -119,18 +187,30 @@ std::optional<InferenceResult> LiveInferencePipeline::process_sample(
         return std::nullopt;
     }
 
-    std::vector<float> contiguous;
-    contiguous.reserve(manifest_.window_size * manifest_.input_dim);
+    const auto window_started = std::chrono::steady_clock::now();
+    contiguous_.clear();
     for (const auto &features : feature_window_)
     {
-        contiguous.insert(contiguous.end(), features.begin(), features.end());
+        contiguous_.insert(contiguous_.end(), features.begin(), features.end());
     }
-    if (contiguous.size() != manifest_.window_size * manifest_.input_dim)
+    if (contiguous_.size() != manifest_.window_size * manifest_.input_dim)
     {
         throw std::runtime_error("Framer produced an invalid inference window size");
     }
 
-    const auto model_output = engine_->infer_logit(contiguous);
+    const auto inference_started = std::chrono::steady_clock::now();
+    const auto outputs = engine_->infer_logits(contiguous_);
+    const auto trigger_started = std::chrono::steady_clock::now();
+    if (outputs.size() != (manifest_.recovery_head ? 2U : 1U))
+        throw std::runtime_error("Engine output count does not match recovery_head in manifest");
+    const auto model_output = outputs[0];
+    std::optional<float> recovery_probability;
+    if (manifest_.recovery_head)
+    {
+        recovery_probability = manifest_.model_output_is_probability ? outputs[1] : sigmoid(outputs[1]);
+        if (!std::isfinite(*recovery_probability) || *recovery_probability < 0 || *recovery_probability > 1)
+            throw std::runtime_error("Model produced an invalid recovery probability");
+    }
     const auto probability = manifest_.model_output_is_probability
         ? model_output
         : sigmoid(model_output);
@@ -138,14 +218,26 @@ std::optional<InferenceResult> LiveInferencePipeline::process_sample(
     {
         throw std::runtime_error("Model produced a non-finite probability");
     }
+    const auto &target = target_frames_.front();
     auto event = trigger_.update(
         probability,
         frame->frame_idx,
         frame->end_sample_idx,
         frame->end_time_ms,
-        sid);
+        sid,
+        recovery_probability,
+        manifest_.prediction_delay_frames ? std::optional<TriggerPosition>(
+            TriggerPosition{target.frame_idx, target.end_sample_idx, target.end_time_ms}) : std::nullopt);
+    if (event) event->decision_monotonic_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const auto completed = std::chrono::steady_clock::now();
+    auto ns = [](auto a, auto b) { return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()); };
     return InferenceResult{
-        std::move(*frame), model_output, probability, std::move(event)};
+        target, model_output, probability, std::move(event), recovery_probability,
+        trigger_.last_event_was_recovery(), manifest_.prediction_delay_frames ? frame : std::nullopt,
+        ns(window_started, inference_started), ns(inference_started, trigger_started),
+        ns(trigger_started, completed), engine_->last_timing()};
 }
 
 std::optional<TriggerEvent> LiveInferencePipeline::flush(const std::string &sid)
@@ -154,11 +246,14 @@ std::optional<TriggerEvent> LiveInferencePipeline::flush(const std::string &sid)
     {
         return std::nullopt;
     }
-    return trigger_.flush(
+    auto event = trigger_.flush(
         last_frame_->frame_idx,
-        last_frame_->end_sample_idx,
-        last_frame_->end_time_ms,
+        manifest_.prediction_delay_frames ? *previous_raw_idx_ : last_frame_->end_sample_idx,
+        manifest_.prediction_delay_frames ? previous_raw_time_ : last_frame_->end_time_ms,
         sid);
+    if (event) event->decision_monotonic_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    return event;
 }
 
 } // namespace dkfz::live

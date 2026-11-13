@@ -89,7 +89,12 @@ class TriggerEvent:
 class StreamingHoldoffLocalMaxTrigger:
     """Expose the canonical C++ trigger state machine through the Python API."""
 
-    def __init__(self, threshold: float, holdoff_frames: int):
+    def __init__(
+        self,
+        threshold: float,
+        holdoff_frames: int,
+        recovery_threshold: float | None = None,
+    ):
         self.threshold = float(threshold)
         self.holdoff_frames = int(holdoff_frames)
         self._native = _live_core.NativeStreamingTriggerDetector(
@@ -97,6 +102,12 @@ class StreamingHoldoffLocalMaxTrigger:
             self.holdoff_frames,
         )
         self._sid_values: dict[str, int | str] = {}
+        if recovery_threshold is not None:
+            self._native.set_recovery_threshold(float(recovery_threshold))
+
+    @property
+    def last_event_was_recovery(self) -> bool:
+        return bool(self._native.last_event_was_recovery)
 
     @staticmethod
     def _sid_token(sid: int | str) -> str:
@@ -126,6 +137,11 @@ class StreamingHoldoffLocalMaxTrigger:
         self._native.reset()
         self._sid_values.clear()
 
+    def set_thresholds(self, detection_threshold: float, emission_threshold: float) -> None:
+        """Match the native runtime's optional earlier emission policy."""
+        self._native.set_thresholds(float(detection_threshold), float(emission_threshold))
+        self.threshold = float(detection_threshold)
+
     def update(
         self,
         probability: float,
@@ -133,6 +149,10 @@ class StreamingHoldoffLocalMaxTrigger:
         current_sample_idx_400hz: int,
         current_time_ms: float | None,
         sid: int | str = 0,
+        recovery_probability: float | None = None,
+        target_frame_idx: int | None = None,
+        target_sample_idx: int | None = None,
+        target_time_ms: float | None = None,
     ) -> TriggerEvent | None:
         event = self._native.update(
             probability=float(probability),
@@ -140,6 +160,10 @@ class StreamingHoldoffLocalMaxTrigger:
             current_sample_idx_400hz=int(current_sample_idx_400hz),
             current_time_ms=current_time_ms,
             sid=self._remember_sid(sid),
+            recovery_probability=recovery_probability,
+            target_frame_idx=target_frame_idx,
+            target_sample_idx=target_sample_idx,
+            target_time_ms=target_time_ms,
         )
         return self._convert_event(event)
 

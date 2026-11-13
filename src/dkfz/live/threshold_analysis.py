@@ -22,7 +22,11 @@ from dkfz.live.event_matching import (
     EVENT_COUNT_KEYS,
     associate_event_positions,
 )
-from dkfz.live.eval_metrics import metrics_from_event_counts
+from dkfz.live.eval_metrics import (
+    metrics_from_event_counts,
+    frame_event_tolerances,
+    independent_prediction_groups,
+)
 from dkfz.live.triggers import StreamingHoldoffLocalMaxTrigger
 
 DEFAULT_ERROR_PLOTS = 12
@@ -35,10 +39,13 @@ def fixed_threshold_analysis(
     *,
     threshold: float,
     sensitivity_efficiency: float = 0.95,
-    holdoff_frames: int = 20,
+    holdoff_frames: int = 10,
     error_association_frames: int = 1,
     thresholds=None,
     additional_sequences=(),
+    recovery_threshold: float | None = None,
+    exact_tolerance_frames: int = 0,
+    outer_error_association_frames: int = 2,
 ) -> ThresholdSelection:
     """Analyze a threshold grid while keeping the configured threshold fixed.
 
@@ -70,6 +77,9 @@ def fixed_threshold_analysis(
             holdoff_frames=holdoff_frames,
             error_association_frames=error_association_frames,
             thresholds=threshold_values,
+            recovery_threshold=recovery_threshold,
+            exact_tolerance_frames=exact_tolerance_frames,
+            outer_error_association_frames=outer_error_association_frames,
         )
     ]
     count_keys = EVENT_COUNT_KEYS
@@ -80,12 +90,22 @@ def fixed_threshold_analysis(
             holdoff_frames=holdoff_frames,
             error_association_frames=error_association_frames,
             thresholds=threshold_values,
+            recovery_threshold=recovery_threshold,
+            exact_tolerance_frames=exact_tolerance_frames,
+            outer_error_association_frames=outer_error_association_frames,
         )
         for row, sequence_row in zip(rows, sequence_rows):
             counts = Counter(
                 {key: int(row[key]) + int(sequence_row[key]) for key in count_keys}
             )
-            row.update(metrics_from_event_counts(counts, error_association_frames))
+            row.update(
+                metrics_from_event_counts(
+                    counts,
+                    error_association_frames,
+                    outer_error_association_frames,
+                    exact_tolerance_frames,
+                )
+            )
             signature = f"{row['predicted_event_signature']}:{sequence_row['predicted_event_signature']}"
             row["predicted_event_signature"] = hashlib.sha256(
                 signature.encode()
@@ -131,6 +151,7 @@ def fixed_threshold_analysis(
         effective_sensitivity_floor=effective_floor,
         metrics=metrics,
         search_rows=tuple(rows),
+        recovery_threshold=recovery_threshold,
     )
 
 
@@ -222,7 +243,9 @@ def classify_validation_events(
     target_col: str,
     holdoff_frames: int,
     error_association_frames: int,
-    outer_error_association_frames: int = 2,
+    outer_error_association_frames: int | None = None,
+    recovery_threshold: float | None = None,
+    exact_tolerance_frames: int | None = None,
 ) -> pd.DataFrame:
     """Return one TP/PE/FP/FN row per event at a selected threshold."""
     required = {"sid", "prob", target_col}
@@ -230,8 +253,19 @@ def classify_validation_events(
     if missing:
         raise KeyError(f"Validation parquet is missing column(s): {', '.join(missing)}")
 
+    policy = frame_event_tolerances(
+        validation_df,
+        error_association_frames=error_association_frames,
+        outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
+    )
     event_rows: list[dict] = []
-    for sid, original_group in validation_df.groupby("sid", sort=False):
+    groups = list(independent_prediction_groups(validation_df))
+    split_streams = (
+        len(groups) > validation_df.sid.nunique(dropna=False)
+        and "raw_idx" in validation_df
+    )
+    for sid, original_group in groups:
         group = original_group.reset_index(drop=True)
         frame_positions = (
             group["frame_idx"].to_numpy(dtype=int)
@@ -248,36 +282,83 @@ def classify_validation_events(
             if "time_ms" in group.columns
             else np.full(len(group), np.nan)
         )
+        delayed = "prediction_delay_frames" in group and bool(
+            group.prediction_delay_frames.max()
+        )
+        observed_frames = (
+            group["observed_frame_idx"].to_numpy(dtype=int)
+            if delayed
+            else frame_positions
+        )
+        observed_raw = (
+            group["observed_raw_frame_end_idx"].to_numpy(dtype=int)
+            if delayed
+            else raw_positions
+        )
+        observed_times = (
+            group["observed_time_ms"].to_numpy(dtype=float) if delayed else times
+        )
+        if delayed:
+            raw_positions = group["raw_frame_end_idx"].to_numpy(dtype=int)
         probabilities = group["prob"].to_numpy(dtype=float)
         target_positions = frame_positions[group[target_col].to_numpy(dtype=float) == 1]
 
         trigger = StreamingHoldoffLocalMaxTrigger(
             threshold=float(threshold),
             holdoff_frames=int(holdoff_frames),
+            recovery_threshold=recovery_threshold,
         )
         events = []
         for index, probability in enumerate(probabilities):
             event = trigger.update(
                 probability=float(probability),
-                current_frame_idx_50hz=int(frame_positions[index]),
-                current_sample_idx_400hz=int(raw_positions[index]),
+                current_frame_idx_50hz=int(observed_frames[index]),
+                current_sample_idx_400hz=int(observed_raw[index]),
                 current_time_ms=(
-                    None if np.isnan(times[index]) else float(times[index])
+                    None
+                    if np.isnan(observed_times[index])
+                    else float(observed_times[index])
                 ),
                 sid=_scalar(sid),
+                **(
+                    dict(
+                        target_frame_idx=int(frame_positions[index]),
+                        target_sample_idx=int(raw_positions[index]),
+                        target_time_ms=(
+                            None if np.isnan(times[index]) else float(times[index])
+                        ),
+                    )
+                    if delayed
+                    else {}
+                ),
+                recovery_probability=(
+                    float(group["recovery_prob"].iloc[index])
+                    if "recovery_prob" in group
+                    else None
+                ),
             )
             if event is not None:
                 events.append(event)
         if len(group):
             event = trigger.flush(
-                current_frame_idx_50hz=int(frame_positions[-1]),
-                current_sample_idx_400hz=int(raw_positions[-1]),
-                current_time_ms=(None if np.isnan(times[-1]) else float(times[-1])),
+                current_frame_idx_50hz=int(observed_frames[-1]),
+                current_sample_idx_400hz=int(observed_raw[-1]),
+                current_time_ms=(
+                    None if np.isnan(observed_times[-1]) else float(observed_times[-1])
+                ),
                 sid=_scalar(sid),
             )
             if event is not None:
                 events.append(event)
 
+        segment_metadata = (
+            dict(
+                segment_raw_start=int(group.raw_idx.min()),
+                segment_raw_end=int(group.raw_idx.max()),
+            )
+            if split_streams
+            else {}
+        )
         predicted_positions = np.asarray(
             [event.peak_frame_idx_50hz for event in events], dtype=int
         )
@@ -285,7 +366,8 @@ def classify_validation_events(
             predicted_positions,
             target_positions,
             error_association_frames=error_association_frames,
-            outer_error_association_frames=outer_error_association_frames,
+            outer_error_association_frames=policy["outer_error_association_frames"],
+            exact_tolerance_frames=policy["exact_tolerance_frames"],
         )
         source_file = (
             str(group.iloc[0]["source_file"])
@@ -305,6 +387,7 @@ def classify_validation_events(
             )
             event_rows.append(
                 {
+                    **segment_metadata,
                     "sid": _scalar(sid),
                     "source_file": source_file,
                     "category": category,
@@ -332,6 +415,7 @@ def classify_validation_events(
         for target_index in association.unmatched_target_indices:
             event_rows.append(
                 {
+                    **segment_metadata,
                     "sid": _scalar(sid),
                     "source_file": source_file,
                     "category": "FN",
@@ -355,6 +439,8 @@ def classify_validation_events(
         "emission_offset_frames",
         "probability",
     ]
+    if split_streams:
+        columns.extend(["segment_raw_start", "segment_raw_end"])
     return pd.DataFrame(event_rows, columns=columns).sort_values(
         ["sid", "target_frame", "predicted_frame"],
         na_position="last",
@@ -450,21 +536,21 @@ def _plot_threshold_rates(
     axis.plot(
         threshold,
         100.0 * search["exact_sensitivity"],
-        label="Exact Se",
+        label="TP Se",
         color="tab:blue",
         linewidth=1.5,
     )
     axis.plot(
         threshold,
         100.0 * search["exact_positive_predictive_value"],
-        label="Exact +P",
+        label="TP +P",
         color="tab:green",
         linewidth=1.5,
     )
     axis.plot(
         threshold,
         100.0 * search["unique_detection_error"],
-        label="Exact DER (display clipped at 105%)",
+        label="Event DER (display clipped at 105%)",
         color="tab:red",
         linewidth=1.5,
     )
@@ -517,6 +603,8 @@ def _plot_threshold_tradeoff(
         label="Outside floor",
     )
     chosen = selection.metrics
+    # Training grids select the current head first. Recovery has its own audit
+    # and FP budget; fixed runtime dashboards replay both heads together.
     axis.scatter(
         [chosen["unmatched_false_positive"]],
         [100.0 * chosen["exact_sensitivity"]],
@@ -555,7 +643,7 @@ def _plot_threshold_tradeoff(
     axis.set(
         title="False-positive/sensitivity trade-off",
         xlabel="Unmatched FP",
-        ylabel="Exact Se (%)",
+        ylabel="TP Se (%)",
     )
     _legend(axis, fontsize=10, loc="lower right")
     colorbar = axis.figure.colorbar(scatter, ax=axis)
@@ -673,11 +761,12 @@ def write_threshold_dashboard(
             f"fp_threshold: {selection.fp_threshold}",
             f"der_threshold: {selection.der_threshold}",
             f"oPE: {chosen.get('outer_position_error', 'not recorded')}",
+            f"TP/PE/oPE radii: {chosen.get('exact_tolerance_frames', 0)}/{chosen.get('error_association_frames', 1)}/{chosen.get('outer_error_association_frames', 2)} frames",
             f"Weighted cost: {chosen.get('weighted_error_count', 'not recorded')}",
             "",
-            f"Best attainable exact Se: {selection.best_attainable_sensitivity:.2%}",
+            f"Best attainable TP Se: {selection.best_attainable_sensitivity:.2%}",
             f"Sensitivity efficiency: {selection.sensitivity_efficiency:.2%}",
-            f"Effective exact Se floor: {selection.effective_sensitivity_floor:.2%}",
+            f"Effective TP Se floor: {selection.effective_sensitivity_floor:.2%}",
             "",
             "Selected: "
             f"PE={int(chosen['position_error'])}, "
@@ -687,6 +776,16 @@ def write_threshold_dashboard(
             f"+P={float(chosen['exact_positive_predictive_value']):.2%}, "
             f"DER={float(chosen['unique_detection_error']):.2%}",
         ]
+        if selection.recovery_max_fp_increase is not None:
+            summary_lines += [
+                "",
+                "Above: primary-head threshold search",
+                f"Recovery threshold: {selection.recovery_threshold}",
+                f"Recovery FP allowance: {selection.recovery_max_fp_increase:.0%}",
+                f"Minimum extra FP allowance: {selection.recovery_min_extra_fp_per_minute or 0:g}/minute",
+                f"Evaluated validation minutes: {selection.recovery_validation_minutes}",
+                "Recovery requires fewer FN and fewer combined FP+FN.",
+            ]
     elif presentation == "fixed":
         summary_lines = [
             "Fixed-threshold live evaluation",
@@ -694,9 +793,9 @@ def write_threshold_dashboard(
             f"Configured threshold: {selection.threshold:.6f}",
             "Threshold selection: not performed",
             "",
-            f"Best attainable exact Se: {selection.best_attainable_sensitivity:.2%}",
+            f"Best attainable TP Se: {selection.best_attainable_sensitivity:.2%}",
             f"Reference sensitivity efficiency: {selection.sensitivity_efficiency:.2%}",
-            f"Reference exact Se floor: {selection.effective_sensitivity_floor:.2%}",
+            f"Reference TP Se floor: {selection.effective_sensitivity_floor:.2%}",
             "",
             "Configured threshold: "
             f"PE={int(chosen['position_error'])}, "
@@ -719,9 +818,9 @@ def write_threshold_dashboard(
                 else f"Applied threshold: {applied_threshold:.6f}"
             ),
             "",
-            f"Best attainable exact Se: {selection.best_attainable_sensitivity:.2%}",
+            f"Best attainable TP Se: {selection.best_attainable_sensitivity:.2%}",
             f"Sensitivity efficiency: {selection.sensitivity_efficiency:.2%}",
-            f"Effective exact Se floor: {selection.effective_sensitivity_floor:.2%}",
+            f"Effective TP Se floor: {selection.effective_sensitivity_floor:.2%}",
             "",
             "Previous: "
             f"PE={int(previous_metrics['position_error'])}, "
@@ -757,7 +856,7 @@ def write_threshold_dashboard(
                 else "ECG trigger threshold selection"
             ),
             "Author": "DKFZ live ECG analysis pipeline",
-            "Subject": "Exact-frame event errors and threshold efficiency",
+            "Subject": "Event timing tiers and threshold efficiency",
         },
     )
     plt.close(figure)
@@ -778,7 +877,7 @@ def write_threshold_dashboard(
                     metadata={
                         "Title": panel_axis.get_title(),
                         "Author": "DKFZ live ECG analysis pipeline",
-                        "Subject": "Exact-frame event errors and threshold efficiency",
+                        "Subject": "Event timing tiers and threshold efficiency",
                     },
                 )
             finally:
@@ -826,6 +925,7 @@ def write_error_examples(
     target_col: str,
     max_plots: int = DEFAULT_ERROR_PLOTS,
     window_frames: int = DEFAULT_ERROR_WINDOW_FRAMES,
+    recovery_threshold: float | None = None,
 ) -> int:
     """Write a limited, representative error-centered timeline PDF."""
     plt, PdfPages = _matplotlib_modules()
@@ -843,6 +943,12 @@ def write_error_examples(
             sid = error["sid"]
             center = int(error["center_frame"])
             group = validation_df[validation_df["sid"] == sid].copy()
+            if "segment_raw_start" in error and pd.notna(error["segment_raw_start"]):
+                group = group[
+                    group.raw_idx.between(
+                        error["segment_raw_start"], error["segment_raw_end"]
+                    )
+                ].copy()
             if "frame_idx" not in group.columns:
                 group["frame_idx"] = np.arange(len(group), dtype=int)
             target_frames = group.loc[
@@ -876,8 +982,25 @@ def write_error_examples(
                 )
             ]
 
+            if "segment_raw_start" in error and pd.notna(error["segment_raw_start"]):
+                nearby = nearby[nearby.segment_raw_start.eq(error["segment_raw_start"])]
             figure, axis = plt.subplots(figsize=(12, 4.5))
             axis.plot(window["frame_idx"], window["prob"], color="black", linewidth=1)
+            if "recovery_prob" in window:
+                axis.plot(
+                    window["frame_idx"] - 1,
+                    window["recovery_prob"],
+                    color="tab:orange",
+                    linewidth=1,
+                    label="Recovery (previous frame)",
+                )
+                if recovery_threshold is not None:
+                    axis.axhline(
+                        recovery_threshold,
+                        color="tab:orange",
+                        linestyle=":",
+                        label="Recovery threshold",
+                    )
             axis.axhline(
                 threshold,
                 color="tab:blue",
@@ -968,7 +1091,7 @@ def write_error_examples(
                     f"{error['category']} example | sid={sid} | center frame={center}\n"
                     f"peak classification, emission shown by arrow{nearest_note}"
                 ),
-                xlabel="50 Hz frame",
+                xlabel="Model frame",
                 ylabel="Predicted probability",
                 ylim=(-0.03, 1.03),
             )

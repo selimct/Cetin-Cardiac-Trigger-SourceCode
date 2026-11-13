@@ -51,9 +51,26 @@ class ThresholdSelection:
     search_rows: tuple[dict[str, float | int | bool | str], ...]
     fp_threshold: float | None = None
     der_threshold: float | None = None
+    recovery_threshold: float | None = None
+    recovery_max_fp_increase: float | None = None
+    recovery_min_extra_fp_per_minute: float | None = None
+    recovery_validation_minutes: float | None = None
+    recovery_validation_metrics: dict | None = None
 
     def policy_metadata(self) -> dict:
         return {
+            **(
+                {
+                    "recovery_threshold": self.recovery_threshold,
+                    "recovery_max_fp_increase": self.recovery_max_fp_increase,
+                    "recovery_min_extra_fp_per_minute": self.recovery_min_extra_fp_per_minute,
+                    "recovery_validation_minutes": self.recovery_validation_minutes,
+                    "recovery_error_policy": "reduce_fn_and_fp_plus_fn",
+                    "recovery_validation_metrics": self.recovery_validation_metrics,
+                }
+                if self.recovery_max_fp_increase is not None
+                else {}
+            ),
             "fp_threshold": self.fp_threshold,
             "der_threshold": self.der_threshold,
             "threshold_policy_version": 3,
@@ -147,10 +164,12 @@ def evaluate_threshold_grid(
     pred,
     target_rpeaks,
     *,
-    holdoff_frames: int = 20,
+    holdoff_frames: int = 10,
     error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
     thresholds=None,
     outer_error_association_frames: int = 2,
+    exact_tolerance_frames: int = 0,
+    recovery_threshold: float | None = None,
 ) -> tuple[dict[str, float | int | bool | str], ...]:
     """Evaluate the live event metrics at every supplied threshold."""
     error_association_frames = int(error_association_frames)
@@ -158,6 +177,10 @@ def evaluate_threshold_grid(
         raise ValueError("error_association_frames must be zero or positive.")
 
     pred = np.asarray(pred, dtype=np.float32)
+    dual_pred = pred if pred.ndim == 2 and pred.shape[1] == 2 else None
+    if dual_pred is not None:
+        # Primary threshold/epoch selection stays independent of recovery.
+        pred = pred[:, 0]
     target_rpeaks = np.asarray(target_rpeaks)
     if thresholds is None:
         thresholds = np.linspace(0.0, 1.0, 1001, dtype=np.float32)
@@ -178,11 +201,25 @@ def evaluate_threshold_grid(
             threshold=float(th),
             holdoff_frames=holdoff_frames,
         )
+        if recovery_threshold is not None:
+            if dual_pred is None:
+                raise ValueError(
+                    "A recovery threshold requires both probability columns"
+                )
+            from dkfz.live.recovery import recovery_peaks
+
+            pred_peaks = recovery_peaks(
+                dual_pred,
+                threshold=float(th),
+                recovery_threshold=recovery_threshold,
+                holdoff_frames=holdoff_frames,
+            )
         stats = compute_event_position_metrics(
             pred_peaks,
             target_rpeaks,
             error_association_frames=error_association_frames,
             outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=exact_tolerance_frames,
         )
         search_rows.append(
             {
@@ -350,15 +387,16 @@ def select_threshold(
     *,
     objective: str = "min_error",
     sensitivity_efficiency: float = 0.95,
-    holdoff_frames: int = 20,
+    holdoff_frames: int = 10,
     error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
     thresholds=None,
     outer_error_association_frames: int = 2,
+    exact_tolerance_frames: int = 0,
 ) -> ThresholdSelection:
-    """Select a threshold using exact-frame live-trigger event metrics.
+    """Select a threshold using the configured TP/PE/oPE live-event tiers.
 
-    Only exact peak frames are true positives. Adjacent events are associated
-    solely as position errors. The effective exact-sensitivity floor is
+    Only peak frames within the configured TP radius are true positives.
+    Remaining nearby events are assigned to PE and oPE tiers. The effective exact-sensitivity floor is
     ``sensitivity_efficiency`` times the best sensitivity attainable on the
     supplied threshold grid. ``min_error`` ranks eligible thresholds by
     weighted errors (20 FP + 10 FN + PE + 5 oPE), then FP, FN, oPE, PE,
@@ -372,6 +410,7 @@ def select_threshold(
         error_association_frames=error_association_frames,
         thresholds=thresholds,
         outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
     )
     return select_threshold_from_search_rows(
         rows,

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import glob
 import json
 from pathlib import Path
@@ -32,6 +32,7 @@ from dkfz.live.event_matching import (
     EVENT_COUNT_KEYS,
     event_metrics_from_counts,
     outer_association_frames,
+    tp_tolerance_frames,
 )
 from dkfz.live.eval_metrics import build_event_position_summary
 from dkfz.live.feature_framing import fit_apply_signal_quality_feature
@@ -114,6 +115,43 @@ class JointEpochThresholdResult:
 class _NoOpTiming:
     def mark(self, _label: str) -> None:
         pass
+
+
+def _new_training_model(kwargs, input_dim, device):
+    frozen = bool(kwargs.get("recovery_only"))
+    if frozen and not kwargs.get("_recovery_checkpoint"):
+        raise ValueError(
+            "Frozen recovery training requires a source checkpoint; use run/train_recovery_lopo.py"
+        )
+    model = build_ecg_rnn(
+        input_dim=input_dim,
+        hidden_dim=int(kwargs["hidden_dim"]),
+        num_layers=int(kwargs["num_layers"]),
+        device=device,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
+        checkpoint_path=kwargs.get("_recovery_checkpoint") if frozen else None,
+        initialize_recovery=frozen,
+    )
+    if frozen:
+        model.freeze_primary()
+    return model
+
+
+def _recovery_provenance(kwargs):
+    if not kwargs.get("recovery_only"):
+        return {}
+    return {
+        "evaluation_scope": "recovery_head_conditional_on_frozen_pretrained_base",
+        "base_patient_holdout_verified": False,
+        "primary_weights_frozen": True,
+        "primary_threshold_fixed": True,
+        "recovery_selection_objective": "min_fn_with_fixed_primary_and_fp_budget",
+        "source_config": kwargs["config"],
+        "source_checkpoint": kwargs["_recovery_checkpoint"],
+        "source_checkpoint_sha256": kwargs["_recovery_checkpoint_sha256"],
+        "checkpoint_policy": "nested_recovery_selection_frozen_primary",
+    }
 
 
 def nested_lopo_folds(patient_ids: Iterable[str]) -> tuple[OuterFold, ...]:
@@ -330,7 +368,7 @@ def load_or_build_patient_frames(
     prepped_path = ensure_output_outside_data(prepped_file)
     if bool(kwargs["use_prepped"]):
         frame = pd.concat(
-            load_prepped_training_frame_dfs(str(prepped_path)),
+            load_prepped_training_frame_dfs(str(prepped_path), settings=dict(kwargs)),
             ignore_index=True,
         )
         _validate_cached_patient_sources(frame, patient_groups)
@@ -354,7 +392,9 @@ def load_or_build_patient_frames(
             patient_frames.append(patient_frame)
         frame = pd.concat(patient_frames, ignore_index=True)
         if bool(kwargs["save_prepped"]):
-            save_prepped_training_frame_dfs([frame], str(prepped_path))
+            save_prepped_training_frame_dfs(
+                [frame], str(prepped_path), settings=dict(kwargs)
+            )
 
     return {
         str(patient_id): group.copy().reset_index(drop=True)
@@ -467,6 +507,15 @@ def _aggregate_epoch_threshold_searches(
             for key in _EVENT_COUNT_KEYS
         }
         first = group.iloc[0]
+        for key, default in (
+            ("exact_tolerance_frames", 0),
+            ("error_association_frames", 1),
+            ("outer_error_association_frames", 2),
+        ):
+            if key in group and group[key].fillna(default).nunique() > 1:
+                raise ValueError(
+                    "Cannot pool threshold counts with different event tolerances; recompute the searches"
+                )
         pooled_rows.append(
             {
                 "epoch": int(epoch),
@@ -476,6 +525,7 @@ def _aggregate_epoch_threshold_searches(
                     counts,
                     int(first.get("error_association_frames", 1)),
                     int(first.get("outer_error_association_frames", 2)),
+                    int(first.get("exact_tolerance_frames", 0)),
                 ),
             }
         )
@@ -517,14 +567,61 @@ def _pack_validation_predictions(
     prob_parts: list[np.ndarray] = []
     target_parts: list[np.ndarray] = []
     for frame in prediction_frames:
-        for _sid, group in frame.groupby("sid", sort=False):
-            prob_parts.append(group["prob"].to_numpy(dtype=np.float32))
+        from dkfz.live.eval_metrics import independent_prediction_groups
+
+        for _sid, group in independent_prediction_groups(frame):
+            values = group["prob"].to_numpy(dtype=np.float32)
+            if "recovery_prob" in group:
+                recovery = group["recovery_prob"].to_numpy(dtype=np.float32).copy()
+                recovery[0] = 0.0  # Never recover across independent streams.
+                values = np.column_stack((values, recovery))
+            prob_parts.append(values)
             target_parts.append(group[target_col].to_numpy(dtype=np.float32))
-            prob_parts.append(np.zeros(gap_len, dtype=np.float32))
+            prob_parts.append(
+                np.zeros(
+                    (gap_len, 2) if values.ndim == 2 else gap_len, dtype=np.float32
+                )
+            )
             target_parts.append(np.zeros(gap_len, dtype=np.float32))
     if not prob_parts:
         raise ValueError("Inner validation produced no prediction rows.")
     return np.concatenate(prob_parts), np.concatenate(target_parts)
+
+
+def _calibrate_recovery_frames(prediction_frames, selection, kwargs, output_path=None):
+    if not kwargs.get("recovery_head", False):
+        return selection
+    from dkfz.live.recovery import calibrate_recovery
+
+    probabilities, targets = _pack_validation_predictions(
+        prediction_frames,
+        target_col=str(kwargs["target_col"]),
+        holdoff_frames=int(kwargs["min_distance"]),
+        error_association_frames=int(kwargs["error_association_frames"]),
+    )
+    selection, search = calibrate_recovery(
+        probabilities,
+        np.flatnonzero(targets == 1),
+        selection,
+        holdoff_frames=int(kwargs["min_distance"]),
+        error_association_frames=int(kwargs["error_association_frames"]),
+        outer_error_association_frames=outer_association_frames(
+            kwargs["raw_hz"], kwargs["frame_size_raw"]
+        ),
+        max_fp_increase=float(kwargs.get("recovery_max_fp_increase", 0.10)),
+        min_extra_fp_per_minute=float(
+            kwargs.get("recovery_min_extra_fp_per_minute", 0.5)
+        ),
+        validation_minutes=sum(
+            int(frame["sid"].notna().sum()) for frame in prediction_frames
+        )
+        * float(kwargs["frame_size_raw"])
+        / float(kwargs["raw_hz"])
+        / 60,
+    )
+    if output_path is not None:
+        pd.DataFrame(search).to_csv(output_path, index=False)
+    return selection
 
 
 def select_pooled_inner_threshold(
@@ -536,6 +633,9 @@ def select_pooled_inner_threshold(
     holdoff_frames: int,
     error_association_frames: int,
     outer_error_association_frames: int = 2,
+    recovery_max_fp_increase: float = 0.10,
+    recovery_min_extra_fp_per_minute: float = 0.5,
+    frame_hz: float = 50.0,
 ) -> ThresholdSelection:
     """Select one threshold from pooled patient-held-out event counts."""
     probabilities, targets = _pack_validation_predictions(
@@ -544,7 +644,7 @@ def select_pooled_inner_threshold(
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
     )
-    return select_threshold(
+    selection = select_threshold(
         probabilities,
         np.where(targets == 1)[0],
         objective=objective,
@@ -552,7 +652,28 @@ def select_pooled_inner_threshold(
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
         outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=tp_tolerance_frames(frame_hz),
     )
+    if probabilities.ndim == 2:
+        from dkfz.live.recovery import calibrate_recovery
+
+        selection, _ = calibrate_recovery(
+            probabilities,
+            np.flatnonzero(targets == 1),
+            selection,
+            holdoff_frames=holdoff_frames,
+            error_association_frames=error_association_frames,
+            outer_error_association_frames=outer_error_association_frames,
+            exact_tolerance_frames=tp_tolerance_frames(frame_hz),
+            max_fp_increase=recovery_max_fp_increase,
+            min_extra_fp_per_minute=recovery_min_extra_fp_per_minute,
+            validation_minutes=sum(
+                int(frame["sid"].notna().sum()) for frame in prediction_frames
+            )
+            / frame_hz
+            / 60,
+        )
+    return selection
 
 
 def select_joint_inner_epoch_threshold(
@@ -568,6 +689,16 @@ def select_joint_inner_epoch_threshold(
     ) = None,
 ) -> JointEpochThresholdResult:
     """Select one epoch and threshold from all inner out-of-fold event counts."""
+    if kwargs.get("recovery_only"):
+        return select_frozen_recovery_epoch(
+            inner_results,
+            patient_frames=patient_frames,
+            kwargs=kwargs,
+            feature_cols=feature_cols,
+            input_dim=input_dim,
+            device=device,
+            output_dir=inner_results[0].fold_dir.parent.parent,
+        )
     _bce_epoch, epoch_search = select_fixed_epoch(
         [result.validation_losses for result in inner_results]
     )
@@ -605,6 +736,9 @@ def select_joint_inner_epoch_threshold(
             probabilities,
             np.where(targets == 1)[0],
             holdoff_frames=int(kwargs["min_distance"]),
+            exact_tolerance_frames=tp_tolerance_frames(
+                float(kwargs["raw_hz"]) / int(kwargs["frame_size_raw"])
+            ),
             error_association_frames=int(kwargs["error_association_frames"]),
             outer_error_association_frames=outer_association_frames(
                 kwargs["raw_hz"], kwargs["frame_size_raw"]
@@ -653,12 +787,167 @@ def select_joint_inner_epoch_threshold(
         )
         for result in inner_results
     )
+    threshold_selection = _calibrate_recovery_frames(
+        selected_prediction_frames,
+        threshold_selection,
+        kwargs,
+        inner_results[0].fold_dir.parent.parent / "inner_recovery_threshold_search.csv",
+    )
     return JointEpochThresholdResult(
         selected_epoch=selected_epoch,
         threshold_selection=threshold_selection,
         epoch_search=epoch_search,
         threshold_search=pd.DataFrame(threshold_selection.search_rows),
         selected_prediction_frames=selected_prediction_frames,
+    )
+
+
+def select_frozen_recovery_epoch(
+    inner_results,
+    *,
+    patient_frames,
+    kwargs,
+    feature_cols,
+    input_dim,
+    device,
+    output_dir,
+    prefix="inner",
+    save_predictions=True,
+):
+    """Select recovery epoch/threshold from inner patients with a fixed primary."""
+    from dkfz.live.recovery import calibrate_recovery
+
+    _, losses = select_fixed_epoch(
+        [result.validation_losses for result in inner_results]
+    )
+    policy = kwargs["_recovery_primary_policy"]
+    primary = ThresholdSelection(
+        threshold=float(policy["threshold"]),
+        objective=str(kwargs["threshold_objective"]),
+        sensitivity_efficiency=float(kwargs["threshold_sensitivity_efficiency"]),
+        best_attainable_sensitivity=0.0,
+        effective_sensitivity_floor=0.0,
+        metrics={},
+        search_rows=(),
+        fp_threshold=(
+            policy.get("fp_threshold")
+            if policy.get("fp_threshold") is not None
+            else float(policy["threshold"])
+        ),
+        der_threshold=(
+            policy.get("der_threshold")
+            if policy.get("der_threshold") is not None
+            else float(policy["threshold"])
+        ),
+    )
+    epoch_rows, search_rows = [], []
+    best = None
+    for epoch in range(1, len(inner_results[0].validation_losses) + 1):
+        predictions = [
+            _predict_inner_at_epoch(
+                result,
+                selected_epoch=epoch,
+                patient_frames=patient_frames,
+                kwargs=kwargs,
+                feature_cols=feature_cols,
+                input_dim=input_dim,
+                device=device,
+                save_predictions=False,
+            )
+            for result in inner_results
+        ]
+        probabilities, targets = _pack_validation_predictions(
+            predictions,
+            target_col=str(kwargs["target_col"]),
+            holdoff_frames=int(kwargs["min_distance"]),
+            error_association_frames=int(kwargs["error_association_frames"]),
+        )
+        selected, search = calibrate_recovery(
+            probabilities,
+            np.flatnonzero(targets == 1),
+            primary,
+            holdoff_frames=int(kwargs["min_distance"]),
+            error_association_frames=int(kwargs["error_association_frames"]),
+            outer_error_association_frames=outer_association_frames(
+                kwargs["raw_hz"], kwargs["frame_size_raw"]
+            ),
+            max_fp_increase=float(kwargs["recovery_max_fp_increase"]),
+            min_extra_fp_per_minute=float(
+                kwargs.get("recovery_min_extra_fp_per_minute", 0.5)
+            ),
+            validation_minutes=sum(
+                int(frame["sid"].notna().sum()) for frame in predictions
+            )
+            * float(kwargs["frame_size_raw"])
+            / float(kwargs["raw_hz"])
+            / 60,
+        )
+        measured = selected.recovery_validation_metrics
+        guard = measured.get("early_emission", measured)
+        rank = (
+            measured["unmatched_false_negative"] + measured["outer_position_error"],
+            guard["unmatched_false_negative"] + guard["outer_position_error"],
+            measured["unmatched_false_positive"] + measured["outer_position_error"],
+            measured["position_error"],
+            epoch,
+        )
+        epoch_rows.append(
+            dict(
+                epoch=epoch,
+                threshold=primary.threshold,
+                recovery_threshold=selected.recovery_threshold,
+                **{
+                    key: value
+                    for key, value in measured.items()
+                    if key != "early_emission"
+                },
+            )
+        )
+        search_rows.extend(dict(epoch=epoch, **row) for row in search)
+        if best is None or rank < best[0]:
+            best = (rank, epoch, selected, predictions)
+    _, selected_epoch, selected, predictions = best
+    for row in epoch_rows:
+        row["selected"] = row["epoch"] == selected_epoch
+    for row in search_rows:
+        row["selected"] = row["epoch"] == selected_epoch and row["selected"]
+    output_dir = Path(output_dir)
+    pd.DataFrame(search_rows).to_csv(
+        output_dir / f"{prefix}_recovery_threshold_search.csv", index=False
+    )
+    if save_predictions:
+        predictions = [
+            _predict_inner_at_epoch(
+                result,
+                selected_epoch=selected_epoch,
+                patient_frames=patient_frames,
+                kwargs=kwargs,
+                feature_cols=feature_cols,
+                input_dim=input_dim,
+                device=device,
+                save_predictions=True,
+            )
+            for result in inner_results
+        ]
+    selected = replace(
+        selected,
+        metrics=selected.recovery_validation_metrics,
+        search_rows=tuple(epoch_rows),
+        best_attainable_sensitivity=max(
+            float(row["exact_sensitivity"]) for row in epoch_rows
+        ),
+    )
+    epoch_search = pd.DataFrame(epoch_rows).merge(
+        losses.drop(columns=["selected"]),
+        on="epoch",
+        validate="one_to_one",
+    )
+    return JointEpochThresholdResult(
+        selected_epoch=selected_epoch,
+        threshold_selection=selected,
+        epoch_search=epoch_search,
+        threshold_search=pd.DataFrame(epoch_rows),
+        selected_prediction_frames=tuple(predictions),
     )
 
 
@@ -670,12 +959,16 @@ def _build_loader(
     window_size: int,
     batch_size: int,
     shuffle: bool,
+    recovery_head: bool = False,
+    prediction_delay_frames: int = 0,
 ) -> tuple[SlidingWindowDataset, DataLoader]:
     dataset = SlidingWindowDataset(
         frame,
         feature_cols=list(feature_cols),
         target_col=target_col,
         window_size=window_size,
+        recovery_head=recovery_head,
+        prediction_delay_frames=prediction_delay_frames,
     )
     if not len(dataset):
         raise ValueError("Fold produced no valid sliding windows.")
@@ -702,6 +995,9 @@ def _train_inner_fold(
         evaluation_patient_id=inner_fold.validation_patient_id,
         evaluation_split=VAL_SPLIT,
         signal_quality_mode=str(kwargs["signal_quality_mode"]),
+        signal_quality_stats=(
+            kwargs.get("signal_quality_stats") if kwargs.get("recovery_only") else None
+        ),
     )
     _train_dataset, _val_dataset, train_loader, val_loader = build_training_loaders(
         frames,
@@ -710,6 +1006,8 @@ def _train_inner_fold(
         window_size=int(kwargs["window_size"]),
         batch_size=int(kwargs["batch_size"]),
         timing=_NoOpTiming(),
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     seed = derive_training_seed(
         base_seed,
@@ -718,12 +1016,7 @@ def _train_inner_fold(
         inner_fold.validation_patient_id,
     )
     set_training_seed(seed)
-    model = build_ecg_rnn(
-        input_dim=input_dim,
-        hidden_dim=int(kwargs["hidden_dim"]),
-        num_layers=int(kwargs["num_layers"]),
-        device=device,
-    )
+    model = _new_training_model(kwargs, input_dim, device)
     _train_losses, validation_losses = train_torch(
         model,
         nn.BCEWithLogitsLoss(),
@@ -741,6 +1034,7 @@ def _train_inner_fold(
         models_dir=fold_dir.parent,
         history_filename="train_history.json",
         epoch_checkpoint_dir="epoch_checkpoints",
+        cache_frozen_recovery=bool(kwargs.get("cache_frozen_recovery", True)),
     )
     result = InnerTrainingResult(
         fold=inner_fold,
@@ -757,6 +1051,7 @@ def _train_inner_fold(
             "training_patient_ids": list(inner_fold.training_patient_ids),
             "seed": seed,
             "signal_quality_stats": signal_quality_stats,
+            **_recovery_provenance(kwargs),
         },
     )
     return result
@@ -792,6 +1087,8 @@ def _predict_inner_at_epoch(
         window_size=int(kwargs["window_size"]),
         batch_size=int(kwargs["batch_size"]),
         shuffle=False,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     model = build_ecg_rnn(
         input_dim=input_dim,
@@ -799,6 +1096,8 @@ def _predict_inner_at_epoch(
         num_layers=int(kwargs["num_layers"]),
         device=device,
         checkpoint_path=checkpoint,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     probabilities = predict_validation_probabilities(
         model=model,
@@ -807,7 +1106,9 @@ def _predict_inner_at_epoch(
         use_amp=bool(kwargs["use_amp"]),
     )
     rows = validation_window_rows(dataset)
-    rows["prob"] = probabilities
+    rows["prob"] = probabilities[:, 0] if probabilities.ndim == 2 else probabilities
+    if probabilities.ndim == 2:
+        rows["recovery_prob"] = probabilities[:, 1]
     rows["outer_test_patient_id"] = None
     rows[PATIENT_ID_COL] = result.fold.validation_patient_id
     keep_cols = [
@@ -821,6 +1122,13 @@ def _predict_inner_at_epoch(
             "source_file",
             str(kwargs["target_col"]),
             "prob",
+            "recovery_prob",
+            "prediction_delay_frames",
+            "raw_frame_end_idx",
+            "observed_frame_idx",
+            "observed_raw_idx",
+            "observed_raw_frame_end_idx",
+            "observed_time_ms",
         )
         if col in rows.columns
     ]
@@ -854,6 +1162,9 @@ def _train_final_outer_model(
         evaluation_patient_id=outer_fold.test_patient_id,
         evaluation_split=TEST_SPLIT,
         signal_quality_mode=str(kwargs["signal_quality_mode"]),
+        signal_quality_stats=(
+            kwargs.get("signal_quality_stats") if kwargs.get("recovery_only") else None
+        ),
     )
     train_frame = _split_dataframe(frames, TRAIN_SPLIT)
     test_frame = _split_dataframe(frames, TEST_SPLIT)
@@ -864,6 +1175,8 @@ def _train_final_outer_model(
         window_size=int(kwargs["window_size"]),
         batch_size=int(kwargs["batch_size"]),
         shuffle=True,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     test_dataset, test_loader = _build_loader(
         test_frame,
@@ -872,16 +1185,13 @@ def _train_final_outer_model(
         window_size=int(kwargs["window_size"]),
         batch_size=int(kwargs["batch_size"]),
         shuffle=False,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
 
     seed = derive_training_seed(base_seed, "final", outer_fold.test_patient_id)
     set_training_seed(seed)
-    model = build_ecg_rnn(
-        input_dim=input_dim,
-        hidden_dim=int(kwargs["hidden_dim"]),
-        num_layers=int(kwargs["num_layers"]),
-        device=device,
-    )
+    model = _new_training_model(kwargs, input_dim, device)
     train_torch(
         model,
         nn.BCEWithLogitsLoss(),
@@ -899,6 +1209,7 @@ def _train_final_outer_model(
         models_dir=outer_dir.parent,
         last_filename="final.pth",
         history_filename="final_history.json",
+        cache_frozen_recovery=bool(kwargs.get("cache_frozen_recovery", True)),
     )
     final_path = outer_dir / "final.pth"
     final_model = build_ecg_rnn(
@@ -907,6 +1218,8 @@ def _train_final_outer_model(
         num_layers=int(kwargs["num_layers"]),
         device=device,
         checkpoint_path=final_path,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
     prediction_df, events_df = build_live_eval_outputs(
         model=final_model,
@@ -919,6 +1232,7 @@ def _train_final_outer_model(
         target_col=str(kwargs["target_col"]),
         device=device,
         use_amp=bool(kwargs["use_amp"]),
+        recovery_threshold=threshold_selection.recovery_threshold,
     )
     write_live_eval_artifacts(
         model_dir=outer_dir,
@@ -930,9 +1244,13 @@ def _train_final_outer_model(
         holdoff_frames=int(kwargs["min_distance"]),
         error_association_frames=int(kwargs["error_association_frames"]),
         prefix="test",
+        plots=kwargs.get("plots"),
         metrics_dir=outer_dir / "metrics",
         metrics_prefix="test",
         threshold_selection=None,
+        exact_tolerance_frames=tp_tolerance_frames(
+            float(kwargs["raw_hz"]) / int(kwargs["frame_size_raw"])
+        ),
         outer_error_association_frames=outer_association_frames(
             kwargs["raw_hz"], kwargs["frame_size_raw"]
         ),
@@ -944,6 +1262,7 @@ def _train_final_outer_model(
     metrics.update(
         {
             **threshold_selection.policy_metadata(),
+            **_recovery_provenance(kwargs),
             "outer_test_patient_id": outer_fold.test_patient_id,
             "threshold_selection_source": "nested_inner_out_of_fold",
             "epoch_selection_source": "nested_inner_out_of_fold_event_counts",
@@ -994,6 +1313,7 @@ def _train_final_outer_model(
             "seed": seed,
         }
     )
+    metadata.update(_recovery_provenance(kwargs))
     write_metadata(outer_dir / "train_config.json", metadata)
     return metrics
 
@@ -1022,6 +1342,9 @@ def train_best_full_model(
     frames, signal_quality_stats = fit_apply_signal_quality_feature(
         frames,
         mode=str(kwargs["signal_quality_mode"]),
+        stats=(
+            kwargs.get("signal_quality_stats") if kwargs.get("recovery_only") else None
+        ),
     )
     train_frame = _split_dataframe(frames, TRAIN_SPLIT)
     _train_dataset, train_loader = _build_loader(
@@ -1031,16 +1354,13 @@ def train_best_full_model(
         window_size=int(kwargs["window_size"]),
         batch_size=int(kwargs["batch_size"]),
         shuffle=True,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     )
 
     seed = derive_training_seed(base_seed, "best", *patient_ids)
     set_training_seed(seed)
-    model = build_ecg_rnn(
-        input_dim=input_dim,
-        hidden_dim=int(kwargs["hidden_dim"]),
-        num_layers=int(kwargs["num_layers"]),
-        device=device,
-    )
+    model = _new_training_model(kwargs, input_dim, device)
     print(
         f"Training best.pth on all {len(patient_ids)} patients for "
         f"{selected_epoch} epochs"
@@ -1062,6 +1382,7 @@ def train_best_full_model(
         models_dir=output_dir.parent,
         last_filename="best.pth",
         history_filename="best_history.json",
+        cache_frozen_recovery=bool(kwargs.get("cache_frozen_recovery", True)),
     )
     best_path = output_dir / "best.pth"
 
@@ -1100,6 +1421,7 @@ def train_best_full_model(
         }
     )
     config_path = output_dir / "train_config.json"
+    metadata.update(_recovery_provenance(kwargs))
     write_metadata(config_path, metadata)
     selection_summary = _threshold_summary(threshold_selection)
     selection_summary.update(
@@ -1203,6 +1525,17 @@ def run_nested_lopo(
     """Run nested leave-one-patient-out selection and outer testing."""
     base_seed = validate_training_seed(seed)
     kwargs = dict(kwargs)
+    if kwargs.get("recovery_only") and not all(
+        kwargs.get(key)
+        for key in (
+            "_recovery_checkpoint",
+            "_recovery_primary_policy",
+            "_recovery_checkpoint_sha256",
+        )
+    ):
+        raise ValueError(
+            "Frozen recovery LOPO requires its source checkpoint and policy; use run/train_recovery_lopo.py"
+        )
     kwargs["seed"] = base_seed
     output_path = ensure_output_outside_data(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1255,6 +1588,7 @@ def run_nested_lopo(
             "seed": base_seed,
             "prepped_file": cache_path,
             "checkpoint_policy": "joint_nested_cv_epoch_threshold",
+            **_recovery_provenance(kwargs),
             "threshold_selection": "pooled_inner_out_of_fold_event_counts",
             "epoch_selection": "pooled_inner_out_of_fold_event_counts",
             "folds": [
@@ -1276,6 +1610,7 @@ def run_nested_lopo(
 
     outer_metrics: list[dict[str, Any]] = []
     outer_inner_searches: list[pd.DataFrame] = []
+    all_inner_results = []
     for outer_idx, outer_fold in enumerate(folds, start=1):
         print(
             f"Outer fold {outer_idx}/{len(folds)}: "
@@ -1311,6 +1646,8 @@ def run_nested_lopo(
             input_dim=input_dim,
             device=device,
         )
+        if kwargs.get("recovery_head"):
+            all_inner_results.extend(inner_results)
         selected_epoch = joint_selection.selected_epoch
         threshold_selection = joint_selection.threshold_selection
         joint_selection.epoch_search.to_csv(
@@ -1365,13 +1702,63 @@ def run_nested_lopo(
         target_col=str(kwargs["target_col"]),
         error_association_frames=int(kwargs["error_association_frames"]),
     )
-    selected_epoch, threshold_selection, final_search = select_global_epoch_threshold(
-        outer_inner_searches,
-        objective=str(kwargs["threshold_objective"]),
-        sensitivity_efficiency=float(kwargs["threshold_sensitivity_efficiency"]),
-    )
+    if kwargs.get("recovery_only"):
+        final_selection = select_frozen_recovery_epoch(
+            all_inner_results,
+            patient_frames=patient_frames,
+            kwargs=kwargs,
+            feature_cols=feature_cols,
+            input_dim=input_dim,
+            device=device,
+            output_dir=output_path,
+            prefix="best",
+            save_predictions=False,
+        )
+        selected_epoch = final_selection.selected_epoch
+        threshold_selection = final_selection.threshold_selection
+        final_search = final_selection.threshold_search
+    else:
+        selected_epoch, threshold_selection, final_search = (
+            select_global_epoch_threshold(
+                outer_inner_searches,
+                objective=str(kwargs["threshold_objective"]),
+                sensitivity_efficiency=float(
+                    kwargs["threshold_sensitivity_efficiency"]
+                ),
+            )
+        )
     selection_search_file = output_path / "best_epoch_threshold_search.csv"
+    if kwargs.get("recovery_head") and not kwargs.get("recovery_only"):
+        recovery_frames = [
+            _predict_inner_at_epoch(
+                result,
+                selected_epoch=selected_epoch,
+                patient_frames=patient_frames,
+                kwargs=kwargs,
+                feature_cols=feature_cols,
+                input_dim=input_dim,
+                device=device,
+                save_predictions=False,
+            )
+            for result in all_inner_results
+        ]
+        threshold_selection = _calibrate_recovery_frames(
+            recovery_frames,
+            threshold_selection,
+            kwargs,
+            output_path / "best_recovery_threshold_search.csv",
+        )
     final_search.to_csv(selection_search_file, index=False)
+    if kwargs.get("recovery_head"):
+        from dkfz.live.recovery_calibration import save_recovery_validation
+
+        if kwargs.get("recovery_only"):
+            recovery_frames = final_selection.selected_prediction_frames
+        kwargs["_recovery_validation_log"] = save_recovery_validation(
+            recovery_frames,
+            output_path / "recovery_validation_predictions.parquet",
+            epoch=selected_epoch,
+        )
     best_model = train_best_full_model(
         selected_epoch=selected_epoch,
         threshold_selection=threshold_selection,
@@ -1387,6 +1774,9 @@ def run_nested_lopo(
         selection_search_file=selection_search_file,
     )
     summary["best_model"] = best_model
+    summary.update(_recovery_provenance(kwargs))
+    if kwargs.get("recovery_only"):
+        summary["cv_method"] = "nested_recovery_lopo"
     _write_json(output_path / "summary.json", summary)
     return summary
 

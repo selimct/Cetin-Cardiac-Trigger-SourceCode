@@ -19,6 +19,7 @@
 namespace dkfz::live
 {
 
+inline constexpr std::int64_t kPreprocessingContractVersion = 4;
 inline constexpr const char *kSignalQualityFeature = "signal_quality";
 
 enum class EcgSlopeMode
@@ -199,6 +200,9 @@ struct FeatureFramerConfig
     std::size_t ecg_slope_slow_window_samples = 40;
     SignalQualityMode signal_quality_mode = SignalQualityMode::none;
     SignalQualityStats signal_quality_stats;
+    std::size_t signal_quality_puls_flat_window_frames = 10;
+    std::size_t signal_quality_puls_median_window_frames = 200;
+    bool reset_on_discontinuity = false;
     double ecg_rotation_angle = 0.0;
     double puls_offset = 0.0;
     double ecg_quantile = 0.999;
@@ -284,6 +288,13 @@ class FeatureFramer
     std::optional<std::int64_t> last_sample_idx_;
 };
 
+struct TriggerPosition
+{
+    std::int64_t frame_idx;
+    std::int64_t sample_idx;
+    std::optional<double> time_ms;
+};
+
 struct TriggerEvent
 {
     std::string sid;
@@ -294,6 +305,8 @@ struct TriggerEvent
     std::int64_t emitted_on_sample_idx = 0;
     std::optional<double> emitted_on_time_ms;
     double probability = 0.0;
+    std::optional<std::uint64_t> decision_monotonic_ns;
+    std::optional<std::uint64_t> gpio_asserted_monotonic_ns;
 };
 
 class StreamingTriggerDetector
@@ -305,12 +318,16 @@ class StreamingTriggerDetector
     // Drop a pending peak when changing policy; retain the last emitted holdoff.
     void set_threshold(double threshold);
     void set_thresholds(double detection_threshold, double emission_threshold);
+    void set_recovery_threshold(std::optional<double> threshold);
+    bool last_event_was_recovery() const noexcept { return last_event_was_recovery_; }
     std::optional<TriggerEvent> update(
         double probability,
         std::int64_t frame_idx,
         std::int64_t sample_idx,
         std::optional<double> time_ms,
-        std::string sid = "0");
+        std::string sid = "0",
+        std::optional<double> recovery_probability = std::nullopt,
+        std::optional<TriggerPosition> target = std::nullopt);
     std::optional<TriggerEvent> flush(
         std::int64_t frame_idx,
         std::int64_t sample_idx,
@@ -332,12 +349,20 @@ class StreamingTriggerDetector
         std::int64_t sample_idx,
         std::optional<double> time_ms);
 
+    std::optional<TriggerEvent> update_primary(
+        double probability, std::int64_t frame_idx, std::int64_t sample_idx,
+        std::optional<double> time_ms, std::string sid,
+        std::optional<TriggerPosition> target);
+
     double threshold_;
     double emission_threshold_;
     bool awaiting_below_threshold_ = false;
     std::int64_t holdoff_frames_;
     std::int64_t last_event_frame_;
     std::optional<Candidate> candidate_;
+    std::optional<Candidate> previous_input_;
+    std::optional<double> recovery_threshold_;
+    bool last_event_was_recovery_ = false;
 };
 
 } // namespace dkfz::live

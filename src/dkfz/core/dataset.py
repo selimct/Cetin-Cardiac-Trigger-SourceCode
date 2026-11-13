@@ -73,7 +73,9 @@ class RRPhaseTracker:
             if self.last_r_idx is not None:
                 rr = idx_now - self.last_r_idx
                 if rr <= 0.0:
-                    raise ValueError("R-peak frame indices must increase within a stream.")
+                    raise ValueError(
+                        "R-peak frame indices must increase within a stream."
+                    )
                 if self.rr_hat is None:
                     self.rr_hat = rr
                 else:
@@ -152,7 +154,15 @@ def add_rr_phase(
 
 
 class SlidingWindowDataset(Dataset):
-    def __init__(self, df, feature_cols, target_col, window_size=25):
+    def __init__(
+        self,
+        df,
+        feature_cols,
+        target_col,
+        window_size=25,
+        recovery_head=False,
+        prediction_delay_frames=0,
+    ):
         """Sliding Window Dataset for Torch.
 
         Args:
@@ -161,6 +171,24 @@ class SlidingWindowDataset(Dataset):
             target_col (str): Target feature.
             window_size (int, optional): Sliding Window Size. Defaults to 25.
         """
+        if prediction_delay_frames not in (0, 1) or isinstance(
+            prediction_delay_frames, bool
+        ):
+            raise ValueError("prediction_delay_frames must be 0 or 1")
+        if prediction_delay_frames and recovery_head:
+            raise ValueError("A delayed primary cannot be combined with recovery_head")
+        self.prediction_delay_frames = int(prediction_delay_frames)
+        if int(window_size) < (2 if recovery_head or prediction_delay_frames else 1):
+            raise ValueError(
+                "window_size must be at least 2 with recovery_head, otherwise 1"
+            )
+        self.recovery_head = bool(recovery_head)
+        df = df.copy()
+        if prediction_delay_frames and "frame_idx" in df:
+            changed = df["frame_idx"].diff().ne(1)
+            if "sid" in df:
+                changed |= df.sid.ne(df.sid.shift())
+            df["sid"] = changed.cumsum()
         df = add_live_sequence_id(df)
         self.X = torch.tensor(df[feature_cols].values, dtype=torch.float32)
         self.y = torch.tensor(df[target_col].values, dtype=torch.float32)
@@ -196,7 +224,9 @@ class SlidingWindowDataset(Dataset):
         """
         i = self.starts[idx]
         x = self.X[i : i + self.window_size]
-        y = self.y[i + self.window_size - 1]
+        y = self.y[i + self.window_size - 1 - self.prediction_delay_frames]
+        if self.recovery_head:
+            y = torch.stack((y, self.y[i + self.window_size - 2]))
         seq_id = self.seq_id[i]  # : i + self.window_size + 1]
         return (x, y, seq_id)
 

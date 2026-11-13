@@ -346,6 +346,7 @@ void UartByteDecoder::parse_available()
                 continue;
             }
             synchronized_ = false;
+            ++stream_epoch_;
             resync_discarded_ = 0;
         }
 
@@ -393,18 +394,40 @@ void UartByteDecoder::accept_front_group()
         buffer_.begin() + static_cast<std::ptrdiff_t>(kGroupBytes));
 }
 
+bool GroupAuxiliaryState::begin_group()
+{
+    const bool pulse_updated = pending_pulse_.has_value();
+    if (pending_pulse_)
+    {
+        pulse_ = pending_pulse_;
+    }
+    if (pending_respiration_)
+    {
+        respiration_ = pending_respiration_;
+    }
+    pending_pulse_.reset();
+    pending_respiration_.reset();
+    return pulse_updated;
+}
+
+void GroupAuxiliaryState::stage_group_value(std::uint8_t sign, std::uint16_t value)
+{
+    if (sign == 1)
+    {
+        pending_pulse_ = value;
+    }
+    else if (sign == 2)
+    {
+        pending_respiration_ = value;
+    }
+}
+
 void UartByteDecoder::accept_group(const std::uint8_t *bytes)
 {
     const auto pr_sign = static_cast<std::uint8_t>((bytes[12] >> 4U) & 0x0FU);
     const auto pulse_value = static_cast<std::uint16_t>(
         (static_cast<std::uint16_t>(bytes[12] & 0x0FU) << 8U) | bytes[13]);
-    if (pr_sign == kPulsUpdateSign)
-    {
-        pending_pulses_.push_back(pulse_value);
-        stats_.pulse_queue_high_water = std::max<std::uint64_t>(
-            stats_.pulse_queue_high_water,
-            pending_pulses_.size());
-    }
+    const bool pulse_updated = auxiliary_.begin_group();
 
     constexpr std::array<std::size_t, kSamplesPerGroup> offsets{0, 7, 14, 21};
     const auto group_index = stats_.groups++;
@@ -416,28 +439,14 @@ void UartByteDecoder::accept_group(const std::uint8_t *bytes)
             group_index,
             sample,
             pr_sign,
-            pulse_value);
+            pulse_updated && sample == 0);
     }
-}
-
-bool UartByteDecoder::select_pulse(std::uint16_t fallback)
-{
-    if (pulse_samples_remaining_ > 0)
+    auxiliary_.stage_group_value(pr_sign, pulse_value);
+    if (pr_sign == kPulsUpdateSign)
     {
-        return false;
+        stats_.pulse_queue_high_water = std::max<std::uint64_t>(
+            stats_.pulse_queue_high_water, 1);
     }
-    if (!pending_pulses_.empty())
-    {
-        current_pulse_ = pending_pulses_.front();
-        pending_pulses_.pop_front();
-        pulse_samples_remaining_ = 8;
-        return true;
-    }
-    if (!current_pulse_.has_value())
-    {
-        current_pulse_ = fallback;
-    }
-    return false;
 }
 
 void UartByteDecoder::emit_sample(
@@ -446,9 +455,8 @@ void UartByteDecoder::emit_sample(
     std::uint64_t group_index,
     std::size_t sample_in_group,
     std::uint8_t pr_sign,
-    std::uint16_t pulse_fallback)
+    bool pulse_updated)
 {
-    const bool pulse_updated = select_pulse(pulse_fallback);
     const auto sample_period_ns = 1'000'000'000ULL / sample_rate_hz_;
     const auto relative_ns = stats_.samples * sample_period_ns;
     const auto ecg1_raw = decode_ecg1(bytes, offset);
@@ -460,19 +468,18 @@ void UartByteDecoder::emit_sample(
         realtime_start_ns_ + relative_ns,
         ecg1_raw,
         ecg2_raw,
-        *current_pulse_,
+        auxiliary_.pulse(),
         decode_ext(bytes, sample_in_group),
         pr_sign,
         pulse_updated,
         group_index,
         sample_in_group,
+        auxiliary_.respiration(),
+        stream_epoch_,
+        monotonic_clock_ns(),
     };
     const auto keep_running = callback_(sample);
     ++stats_.samples;
-    if (pulse_samples_remaining_ > 0)
-    {
-        --pulse_samples_remaining_;
-    }
     stopped_ = !keep_running;
 }
 

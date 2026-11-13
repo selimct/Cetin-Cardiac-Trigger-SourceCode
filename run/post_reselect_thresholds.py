@@ -42,7 +42,7 @@ from dkfz.core.network_helpers import (  # noqa: E402
 )
 from dkfz.live.io import repo_relative_path  # noqa: E402
 from dkfz.live.event_matching import (  # noqa: E402
-    EXACT_TOLERANCE_FRAMES,
+    event_tolerances,
     METRICS_SCHEMA_VERSION,
     compute_event_position_metrics,
 )
@@ -189,7 +189,9 @@ def pack_validation_sequences(
     if missing:
         raise KeyError(f"Validation parquet is missing column(s): {', '.join(missing)}")
 
-    groups = df.groupby("sid", sort=False) if "sid" in df.columns else [(0, df)]
+    from dkfz.live.eval_metrics import independent_prediction_groups
+
+    groups = independent_prediction_groups(df)
     gap_len = int(max(holdoff_frames + 1, 2 * error_association_frames + 1, 20))
     probability_parts: list[np.ndarray] = []
     target_parts: list[np.ndarray] = []
@@ -218,7 +220,18 @@ def read_validation_analysis_rows(path: Path, target_col: str) -> pd.DataFrame:
     missing = sorted(required - available)
     if missing:
         raise KeyError(f"Validation parquet is missing column(s): {', '.join(missing)}")
-    optional = ("frame_idx", "raw_idx", "time_ms", "source_file")
+    optional = (
+        "frame_idx",
+        "raw_idx",
+        "time_ms",
+        "source_file",
+        "prediction_delay_frames",
+        "raw_frame_end_idx",
+        "observed_frame_idx",
+        "observed_raw_idx",
+        "observed_raw_frame_end_idx",
+        "observed_time_ms",
+    )
     columns = [
         "sid",
         "prob",
@@ -235,6 +248,8 @@ def metrics_at_threshold(
     threshold: float,
     holdoff_frames: int,
     error_association_frames: int,
+    exact_tolerance_frames: int = 0,
+    outer_error_association_frames: int = 2,
 ) -> dict[str, float | int]:
     """Evaluate one existing threshold through the common event contract."""
     target_peaks = np.flatnonzero(targets == 1)
@@ -247,6 +262,8 @@ def metrics_at_threshold(
         predicted_peaks,
         target_peaks,
         error_association_frames=error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
+        outer_error_association_frames=outer_error_association_frames,
     )
 
 
@@ -334,7 +351,10 @@ def apply_selection(
         ),
         "holdoff_frames": holdoff_frames,
         "metrics_schema_version": METRICS_SCHEMA_VERSION,
-        "exact_tolerance_frames": EXACT_TOLERANCE_FRAMES,
+        "exact_tolerance_frames": int(applied_metrics.get("exact_tolerance_frames", 0)),
+        "outer_error_association_frames": int(
+            applied_metrics.get("outer_error_association_frames", 2)
+        ),
         "error_association_frames": error_association_frames,
         **{f"validation_{key}": value for key, value in applied_metrics.items()},
         "threshold_search_file": repo_relative_path(artifacts.search_path),
@@ -378,8 +398,19 @@ def apply_selection(
                 for key, value in applied_metrics.items()
             },
             "metrics_schema_version": METRICS_SCHEMA_VERSION,
-            "exact_tolerance_frames": EXACT_TOLERANCE_FRAMES,
+            "exact_tolerance_frames": int(
+                applied_metrics.get("exact_tolerance_frames", 0)
+            ),
+            "outer_error_association_frames": int(
+                applied_metrics.get("outer_error_association_frames", 2)
+            ),
             "error_association_frames": error_association_frames,
+            "outer_error_association_ms": int(
+                applied_metrics.get("outer_error_association_frames", 2)
+            )
+            * float(config.get("frame_size_raw", 8))
+            / float(config.get("raw_hz", 400))
+            * 1000,
             f"{artifacts.report_prefix}_threshold_search_file": repo_relative_path(
                 artifacts.search_path
             ),
@@ -416,9 +447,14 @@ def reselect_variant(
 ) -> dict:
     """Analyze and optionally persist one model variant's threshold."""
     config = json.loads(artifacts.config_path.read_text(encoding="utf-8"))
+    if config.get("recovery_head"):
+        raise ValueError(
+            "Two-output models require joint recovery calibration; use run/calibrate_recovery.py"
+        )
     target_col = str(config.get("target_col", "target"))
-    holdoff_frames = int(config.get("holdoff_frames", config.get("min_distance", 20)))
-    error_association_frames = int(config.get("error_association_frames", 1))
+    holdoff_frames = int(config.get("holdoff_frames", config.get("min_distance", 10)))
+    policy = event_tolerances(config)
+    error_association_frames = policy["error_association_frames"]
     previous_threshold = float(config["threshold"])
 
     validation_df = read_validation_analysis_rows(artifacts.validation_path, target_col)
@@ -435,6 +471,8 @@ def reselect_variant(
         threshold=previous_threshold,
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
+        exact_tolerance_frames=policy["exact_tolerance_frames"],
+        outer_error_association_frames=policy["outer_error_association_frames"],
     )
     if apply_threshold is not None:
         apply_threshold = float(apply_threshold)
@@ -452,6 +490,8 @@ def reselect_variant(
         sensitivity_efficiency=sensitivity_efficiency,
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
+        exact_tolerance_frames=policy["exact_tolerance_frames"],
+        outer_error_association_frames=policy["outer_error_association_frames"],
         thresholds=thresholds,
     )
 
@@ -471,6 +511,8 @@ def reselect_variant(
             threshold=apply_threshold,
             holdoff_frames=holdoff_frames,
             error_association_frames=error_association_frames,
+            exact_tolerance_frames=policy["exact_tolerance_frames"],
+            outer_error_association_frames=policy["outer_error_association_frames"],
         )
 
     report_threshold = (
@@ -503,6 +545,8 @@ def reselect_variant(
         target_col=target_col,
         holdoff_frames=holdoff_frames,
         error_association_frames=error_association_frames,
+        exact_tolerance_frames=policy["exact_tolerance_frames"],
+        outer_error_association_frames=policy["outer_error_association_frames"],
     )
     event_df.to_csv(artifacts.events_path, index=False)
     write_threshold_dashboard(

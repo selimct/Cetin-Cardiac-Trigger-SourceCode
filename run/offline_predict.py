@@ -9,7 +9,7 @@ This script loads the model and live preprocessing config produced by
 and writes two outputs:
 
 - event parquet: one row per emitted trigger
-- prediction parquet: one row per evaluated 50 Hz model window, including
+- prediction parquet: one row per evaluated model-rate window, including
   `prob`, peak-event `pred`, optional `target`/`siemens_tr`, and input features
 
 Use ``--skip-metrics`` to save predictions without computing or writing
@@ -73,6 +73,7 @@ from dkfz.live.prediction_runtime import (
     write_prediction_parquets,
 )
 from dkfz.live.prediction_logs import build_prediction_log
+from dkfz.live.runtime_config import effective_recovery_threshold
 from dkfz.core.model import ECG_RNN
 from dkfz.core.gradient_noise import (
     GRADIENT_MAIN_FREQUENCIES_HZ,
@@ -94,7 +95,7 @@ PREDICTION_RUNTIME_DEFAULTS = {
     "model_variant": "best",
     "model_dir": None,
     "holdoff_frames": None,
-    "holdoff_ms": 180.0,
+    "holdoff_ms": 200.0,
     "error_association_frames": 1,
     "ecg1_col": "ecg1_raw",
     "ecg2_col": "ecg2_raw",
@@ -137,6 +138,15 @@ PREDICTION_CONFIG_REQUIRED_KEYS = {
 }
 
 PREDICTION_CONFIG_OPTIONAL_KEYS = {
+    "feature_cols",
+    "preprocessing_contract_version",
+    "prediction_mode",
+    "prediction_delay_frames",
+    "signal_quality_puls_flat_window_frames",
+    "signal_quality_puls_median_window_frames",
+    "recovery_head",
+    "recovery_enabled",
+    "recovery_threshold",
     "threshold",
     "holdoff_frames",
     "error_association_frames",
@@ -190,6 +200,20 @@ def _prediction_config_resolution_from_values(values: dict):
         ),
     )
     kwargs = resolution.values
+    from dkfz.live.prediction_contract import prediction_delay
+
+    prediction_delay(kwargs)
+    from dkfz.live.event_matching import event_tolerances
+
+    metric_policy = event_tolerances(
+        cfg, error_association_frames=values.get("error_association_frames")
+    )
+    kwargs.update(metric_policy)
+    resolution.derived_values.update(metric_policy)
+    kwargs["recovery_threshold"] = effective_recovery_threshold(
+        kwargs, disable_recovery=bool(values.get("disable_recovery", False))
+    )
+    resolution.derived_values["recovery_threshold"] = kwargs["recovery_threshold"]
 
     model_dir = variant.model_dir(str(kwargs["modelname"]), requested_model_dir)
     kwargs["model_dir"] = str(model_dir)
@@ -266,6 +290,7 @@ def _live_predict_one(
     synthetic_main_frequency_hz: float | None = None,
     save_synthetic: bool = False,
     skip_metrics: bool = False,
+    disable_recovery: bool = False,
 ):
     """Run a trained live ECG model over one parquet file.
 
@@ -300,6 +325,8 @@ def _live_predict_one(
             and a target column is available, the report is written under
             the selected model directory's `metrics` subdirectory.
         skip_metrics: Skip evaluation statistics even when annotations exist.
+        disable_recovery: Emit events from the current output only, retaining
+            the checkpoint's two-output shape and saved recovery calibration.
         synthetic_gradient: Apply the notebook's gradient noise to ECG1/ECG2
             before preprocessing, with seed 42, then derive
             ecg3_syn = ecg2_syn - ecg1_syn. Predictions consume ecgN_syn columns
@@ -424,6 +451,8 @@ def _live_predict_one(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
+        recovery_head=bool(kwargs.get("recovery_head", False)),
+        prediction_delay_frames=int(kwargs.get("prediction_delay_frames", 0)),
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     print(
@@ -441,6 +470,7 @@ def _live_predict_one(
         device=device,
         model_output_is_probability=False,
         framer=framer,
+        recovery_threshold=kwargs.get("recovery_threshold"),
     )
 
     events, log_df = predictor.run_dataframe(
@@ -482,8 +512,29 @@ def _live_predict_one(
             prediction_df=log_df,
             target_col=resolved_target_col,
             error_association_frames=error_association_frames,
+            exact_tolerance_frames=int(kwargs["exact_tolerance_frames"]),
+            outer_error_association_frames=int(
+                kwargs["outer_error_association_frames"]
+            ),
             threshold=float(threshold),
             events_df=events_df,
+        )
+        if predictor.prediction_delay_frames:
+            from dkfz.live.raw_event_evaluation import evaluate_raw_events
+
+            metrics["raw_events"] = evaluate_raw_events(
+                df,
+                events_df,
+                log_df,
+                frame_size_raw=int(kwargs["frame_size_raw"]),
+                target_col=resolved_target_col,
+                raw_hz=float(kwargs["raw_hz"]),
+                time_col=time_col,
+                time_unit=time_unit,
+            )
+        metrics.update(
+            recovery_head=bool(kwargs.get("recovery_head", False)),
+            recovery_threshold=kwargs.get("recovery_threshold"),
         )
         report_text = format_prediction_metrics_report(metrics)
         text_path = write_prediction_metrics_report(
@@ -528,6 +579,7 @@ def live_predict(
     synthetic_main_frequency_hz: float | None = None,
     save_synthetic: bool = False,
     skip_metrics: bool = False,
+    disable_recovery: bool = False,
 ):
     """Run a trained live ECG model over parquet files, directories, or globs."""
     input_paths, multiple_inputs = resolve_prediction_inputs(
@@ -565,6 +617,7 @@ def live_predict(
             synthetic_main_frequency_hz=synthetic_main_frequency_hz,
             save_synthetic=save_synthetic,
             skip_metrics=skip_metrics,
+            disable_recovery=disable_recovery,
         )
 
 
@@ -590,6 +643,12 @@ if __name__ == "__main__":
     )
     parser.set_defaults(include_input_name_in_outputs=None)
     parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument(
+        "--no-recovery",
+        dest="disable_recovery",
+        action="store_true",
+        help="Use only the current output of a two-output model; keep saved calibration.",
+    )
     parser.add_argument("--modelname", type=str, default=None)
     parser.add_argument(
         "--model-variant",

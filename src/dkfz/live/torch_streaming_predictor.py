@@ -35,6 +35,12 @@ class LiveLSTMPredictor(LiveStreamingPredictor):
         self.device = default_torch_device() if device is None else torch.device(device)
         self.model = model.to(self.device).eval()
         self.model_output_is_probability = bool(model_output_is_probability)
+        framer_kwargs.setdefault(
+            "prediction_delay_frames", int(getattr(model, "prediction_delay_frames", 0))
+        )
+        framer_kwargs.setdefault(
+            "recovery_head", bool(getattr(model, "recovery_head", False))
+        )
         super().__init__(
             window_size=window_size,
             threshold=threshold,
@@ -51,12 +57,17 @@ class LiveLSTMPredictor(LiveStreamingPredictor):
             raise TypeError("Model output must be a tensor or tuple/list of tensors.")
 
         y = model_output.reshape(-1)
-        if y.numel() != 1:
-            raise ValueError(f"Expected one scalar output, got {y.numel()} values.")
+        expected = 2 if self.recovery_head else 1
+        if y.numel() != expected:
+            raise ValueError(
+                f"Expected {expected} model outputs, got {y.numel()} values."
+            )
 
-        if self.model_output_is_probability:
-            return float(y.item())
-        return float(torch.sigmoid(y).item())
+        probabilities = y if self.model_output_is_probability else torch.sigmoid(y)
+        self.last_recovery_probability = (
+            float(probabilities[1].item()) if self.recovery_head else None
+        )
+        return float(probabilities[0].item())
 
     def _run_model_on_current_window(self) -> float:
         window = np.stack(self._feature_window, axis=0).astype(np.float32)

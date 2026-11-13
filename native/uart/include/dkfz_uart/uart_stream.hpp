@@ -9,7 +9,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -36,6 +35,29 @@ struct DecodedSample
     bool puls_updated = false;
     std::uint64_t source_packet = 0;
     std::size_t sample_in_packet = 0;
+    std::optional<std::uint16_t> resp_raw;
+    // Changes after lost UART synchronization; decoded raw_index remains
+    // consecutive because the wire protocol has no absolute sample counter.
+    std::uint64_t stream_epoch = 0;
+    // Host time at decode, independent of the reconstructed sample clock.
+    std::uint64_t decoded_monotonic_ns = 0;
+};
+
+// Auxiliary values carried in a three-long/one-short packet group become
+// visible only when the following group starts. ECG and EXT stay in their group.
+class GroupAuxiliaryState
+{
+  public:
+    bool begin_group();
+    void stage_group_value(std::uint8_t sign, std::uint16_t value);
+    std::uint16_t pulse() const { return pulse_.value_or(2048); }
+    std::optional<std::uint16_t> respiration() const { return respiration_; }
+
+  private:
+    std::optional<std::uint16_t> pulse_;
+    std::optional<std::uint16_t> respiration_;
+    std::optional<std::uint16_t> pending_pulse_;
+    std::optional<std::uint16_t> pending_respiration_;
 };
 
 struct UartSignalOffsets
@@ -89,14 +111,13 @@ class UartByteDecoder
     void parse_available();
     void accept_front_group();
     void accept_group(const std::uint8_t *bytes);
-    bool select_pulse(std::uint16_t fallback);
     void emit_sample(
         const std::uint8_t *bytes,
         std::size_t offset,
         std::uint64_t group_index,
         std::size_t sample_in_group,
         std::uint8_t pr_sign,
-        std::uint16_t pulse_fallback);
+        bool pulse_updated);
 
     std::uint32_t sample_rate_hz_;
     SampleCallback callback_;
@@ -107,9 +128,8 @@ class UartByteDecoder
     bool synchronized_ = false;
     bool ever_synchronized_ = false;
     std::size_t resync_discarded_ = 0;
-    std::deque<std::uint16_t> pending_pulses_;
-    std::optional<std::uint16_t> current_pulse_;
-    std::uint32_t pulse_samples_remaining_ = 0;
+    std::uint64_t stream_epoch_ = 0;
+    GroupAuxiliaryState auxiliary_;
     bool stopped_ = false;
 };
 

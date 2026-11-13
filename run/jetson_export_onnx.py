@@ -92,6 +92,7 @@ def main() -> int:
                 path,
                 modelname=args.modelname,
                 model_dir=args.model_dir,
+                model_variant=args.model_variant,
                 label=label,
             )
     except ValueError as exc:

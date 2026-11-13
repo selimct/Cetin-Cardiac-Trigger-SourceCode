@@ -2,13 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Developed at the German Cancer Research Center (DKFZ).
 
-"""Exact-frame event association shared by training and prediction reports.
-
-An exact match is the only true positive.  After exact matches are removed,
-nearby prediction/target pairs may be associated solely to attribute one
-positioning mistake instead of reporting an unrelated false positive and false
-negative. Association grants true-positive credit only for beat metrics.
-"""
+"""One-to-one TP/PE/oPE association shared by training and prediction reports."""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-METRICS_SCHEMA_VERSION = 3
+METRICS_SCHEMA_VERSION = 4
 EXACT_TOLERANCE_FRAMES = 0
 DEFAULT_ERROR_ASSOCIATION_FRAMES = 1
 DEFAULT_OUTER_ERROR_ASSOCIATION_FRAMES = 2
@@ -35,8 +29,61 @@ EVENT_COUNT_KEYS = (
 
 
 def outer_association_frames(raw_hz=400.0, frame_size_raw=8) -> int:
-    """Largest integral frame offset within the inclusive 40 ms window."""
+    """Option-2 outer tier at 100 Hz; retain the legacy rule at other rates."""
+    if np.isclose(float(raw_hz) / int(frame_size_raw), 100.0):
+        return 5
     return int(np.floor(0.040 * float(raw_hz) / int(frame_size_raw) + 1e-9))
+
+
+def tp_tolerance_frames(frame_hz=50.0) -> int:
+    return 1 if np.isclose(float(frame_hz), 100.0) else 0
+
+
+def event_tolerances(settings, *, error_association_frames=None):
+    """Resolve the current policy, migrating old 100 Hz reporting defaults.
+
+    Schema-3 100 Hz configs recorded 0/2/4. Those counts must be recomputed,
+    rather than retained as explicit overrides of the new 1/3/5 policy.
+    Explicit CLI PE radii and schema-4 saved PE overrides remain supported.
+    """
+    raw_hz = float(settings.get("raw_hz", 400))
+    size = int(settings.get("frame_size_raw", 8))
+    exact = tp_tolerance_frames(raw_hz / size)
+    if error_association_frames is None:
+        error_association_frames = (
+            3
+            if exact and int(settings.get("metrics_schema_version", 0) or 0) < 4
+            else settings.get("error_association_frames", 3 if exact else 1)
+        )
+    return dict(
+        exact_tolerance_frames=exact,
+        error_association_frames=int(error_association_frames),
+        outer_error_association_frames=outer_association_frames(raw_hz, size),
+    )
+
+
+def _claim_within(predicted, targets, pred_indices, target_indices, radius):
+    """Chronological one-to-one matching on the remaining sorted positions."""
+    pairs, unmatched_pred, unmatched_target = [], [], []
+    p = t = 0
+    while p < len(pred_indices) and t < len(target_indices):
+        pi, ti = pred_indices[p], target_indices[t]
+        delta = int(predicted[pi] - targets[ti])
+        if abs(delta) <= radius:
+            pairs.append((pi, ti))
+            p += 1
+            t += 1
+        elif delta < -radius:
+            unmatched_pred.append(pi)
+            p += 1
+        else:
+            unmatched_target.append(ti)
+            t += 1
+    return (
+        pairs,
+        unmatched_pred + pred_indices[p:],
+        unmatched_target + target_indices[t:],
+    )
 
 
 @dataclass(frozen=True)
@@ -72,16 +119,21 @@ def associate_event_positions(
     *,
     error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
     outer_error_association_frames: int | None = DEFAULT_OUTER_ERROR_ASSOCIATION_FRAMES,
+    exact_tolerance_frames: int = EXACT_TOLERANCE_FRAMES,
 ) -> EventAssociation:
-    """Associate events while reserving true positives for exact frames only.
+    """Claim identical frames, then tolerant TPs, PE, and oPE in that order.
 
-    Exact pairs are claimed first. Remaining sorted events are paired
-    one-to-one within ``error_association_frames``. These latter pairs are
-    position errors, not true positives.
+    Identical frames have first priority, followed by remaining pairs within
+    the TP radius. Each event is used at most once, including in later tiers.
     """
     radius = int(error_association_frames)
     if radius < 0:
         raise ValueError("error_association_frames must be zero or positive.")
+    exact_radius = int(exact_tolerance_frames)
+    if exact_radius < 0 or radius < exact_radius:
+        raise ValueError(
+            "Require 0 <= exact_tolerance_frames <= error_association_frames"
+        )
 
     predicted = _positions(predicted_positions, "predicted_positions")
     targets = _positions(target_positions, "target_positions")
@@ -102,58 +154,32 @@ def associate_event_positions(
     remaining_pred = [int(i) for i in pred_order if int(i) not in exact_pred]
     remaining_target = [int(i) for i in target_order if int(i) not in exact_target]
 
-    position_matches: list[tuple[int, int]] = []
-    unmatched_pred: list[int] = []
-    unmatched_target: list[int] = []
-    pred_cursor = 0
-    target_cursor = 0
-
-    while pred_cursor < len(remaining_pred) and target_cursor < len(remaining_target):
-        pred_idx = remaining_pred[pred_cursor]
-        target_idx = remaining_target[target_cursor]
-        delta = int(predicted[pred_idx] - targets[target_idx])
-        if abs(delta) <= radius:
-            position_matches.append((pred_idx, target_idx))
-            pred_cursor += 1
-            target_cursor += 1
-        elif delta < -radius:
-            unmatched_pred.append(pred_idx)
-            pred_cursor += 1
-        else:
-            unmatched_target.append(target_idx)
-            target_cursor += 1
-
-    unmatched_pred.extend(remaining_pred[pred_cursor:])
-    unmatched_target.extend(remaining_target[target_cursor:])
-    inner = EventAssociation(
+    if exact_radius:
+        nearby, remaining_pred, remaining_target = _claim_within(
+            predicted, targets, remaining_pred, remaining_target, exact_radius
+        )
+        exact_matches += tuple(nearby)
+    position_matches, remaining_pred, remaining_target = _claim_within(
+        predicted, targets, remaining_pred, remaining_target, radius
+    )
+    outer_matches = []
+    if (
+        outer_error_association_frames is not None
+        and int(outer_error_association_frames) > radius
+    ):
+        outer_matches, remaining_pred, remaining_target = _claim_within(
+            predicted,
+            targets,
+            remaining_pred,
+            remaining_target,
+            int(outer_error_association_frames),
+        )
+    return EventAssociation(
         exact_matches=exact_matches,
         position_matches=tuple(position_matches),
-        unmatched_prediction_indices=tuple(unmatched_pred),
-        unmatched_target_indices=tuple(unmatched_target),
-    )
-
-    if (
-        outer_error_association_frames is None
-        or int(outer_error_association_frames) <= radius
-    ):
-        return inner
-    outer = associate_event_positions(
-        predicted[list(inner.unmatched_prediction_indices)],
-        targets[list(inner.unmatched_target_indices)],
-        error_association_frames=int(outer_error_association_frames),
-        outer_error_association_frames=None,
-    )
-    pi, ti = inner.unmatched_prediction_indices, inner.unmatched_target_indices
-    return EventAssociation(
-        exact_matches=inner.exact_matches,
-        position_matches=inner.position_matches,
-        outer_position_matches=tuple(
-            (pi[p], ti[t]) for p, t in outer.exact_matches + outer.position_matches
-        ),
-        unmatched_prediction_indices=tuple(
-            pi[p] for p in outer.unmatched_prediction_indices
-        ),
-        unmatched_target_indices=tuple(ti[t] for t in outer.unmatched_target_indices),
+        outer_position_matches=tuple(outer_matches),
+        unmatched_prediction_indices=tuple(remaining_pred),
+        unmatched_target_indices=tuple(remaining_target),
     )
 
 
@@ -167,8 +193,9 @@ def compute_event_position_metrics(
     *,
     error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
     outer_error_association_frames: int | None = DEFAULT_OUTER_ERROR_ASSOCIATION_FRAMES,
+    exact_tolerance_frames: int = EXACT_TOLERANCE_FRAMES,
 ) -> dict[str, float | int]:
-    """Return exact-frame counts and unique-error metrics.
+    """Return configured TP/PE/oPE counts and unique-error metrics.
 
     ``position_error`` consumes one prediction and one target but contributes
     only once to ``unique_detection_error``. Beat metrics count it as a true
@@ -181,6 +208,7 @@ def compute_event_position_metrics(
         targets,
         error_association_frames=error_association_frames,
         outer_error_association_frames=outer_error_association_frames,
+        exact_tolerance_frames=exact_tolerance_frames,
     )
     offsets = [int(predicted[p] - targets[t]) for p, t in association.position_matches]
     outer_offsets = [
@@ -198,12 +226,18 @@ def compute_event_position_metrics(
         "unmatched_false_negative": len(association.unmatched_target_indices),
     }
     return event_metrics_from_counts(
-        counts, error_association_frames, outer_error_association_frames
+        counts,
+        error_association_frames,
+        outer_error_association_frames,
+        exact_tolerance_frames,
     )
 
 
 def event_metrics_from_counts(
-    counts, error_association_frames=1, outer_error_association_frames=2
+    counts,
+    error_association_frames=1,
+    outer_error_association_frames=2,
+    exact_tolerance_frames=0,
 ):
     """Recompute pooled rates without counting either positional tier as FP/FN."""
     c = {key: int(counts.get(key, 0)) for key in EVENT_COUNT_KEYS}
@@ -223,7 +257,7 @@ def event_metrics_from_counts(
     cost = 20 * fp + 10 * fn + pe + 5 * ope
     return {
         "metrics_schema_version": METRICS_SCHEMA_VERSION,
-        "exact_tolerance_frames": EXACT_TOLERANCE_FRAMES,
+        "exact_tolerance_frames": int(exact_tolerance_frames),
         "error_association_frames": int(error_association_frames),
         "outer_error_association_frames": int(outer_error_association_frames or 0),
         "num_predicted_events": predicted,

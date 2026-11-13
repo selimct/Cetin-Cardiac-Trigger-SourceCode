@@ -11,6 +11,7 @@
 #include "dkfz_live/input_validity.hpp"
 #include "dkfz_live/runtime_output.hpp"
 #include "dkfz_live/runtime_health.hpp"
+#include "dkfz_live/thread_scheduling.hpp"
 #include "dkfz_uart/uart_stream.hpp"
 
 #include <atomic>
@@ -48,6 +49,7 @@ struct IntegratedRuntimeConfig
     std::filesystem::path threshold_override_path;
     bool early_emission = true;
     bool emit_probabilities = false;
+    ThreadSchedulingConfig scheduling;
     InputResetConfig input_reset;
     RuntimeOutputConfig output;
     bool hard_exit_on_watchdog = true;
@@ -65,6 +67,8 @@ struct IntegratedRuntimeSummary
     std::uint64_t malformed_groups = 0;
     std::uint64_t bytes_discarded = 0;
     std::uint64_t max_inference_duration_ns = 0;
+    std::uint64_t missed_frame_deadlines = 0;
+    std::uint64_t max_frame_end_to_completion_ns = 0;
     std::size_t queue_high_water = 0;
     std::uint64_t output_records = 0;
     std::uint64_t gpio_pulses = 0;
