@@ -20,6 +20,8 @@ namespace dkfz::live
 {
 
 inline constexpr std::int64_t kPreprocessingContractVersion = 4;
+// Eight 400 Hz samples span 20 ms, independently of the model frame cadence.
+inline constexpr std::size_t kFastSlopeWindowSamples = 8;
 inline constexpr const char *kSignalQualityFeature = "signal_quality";
 
 enum class EcgSlopeMode

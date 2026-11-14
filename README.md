@@ -57,6 +57,18 @@ normal models and their recovery and `delayed_100hz/` variants. They use p02 hea
 p14 heart/head,
 and p16 head/heart/pelvis. `./metrics.sh` defaults to the normal run.
 
+To evaluate only normal 50 Hz and delayed 100 Hz models, skipping all recovery
+versions (including frozen and LOPO recovery), add `--exclude-recovery-models`:
+
+```bash
+./metrics.sh normal --exclude-recovery-models
+./metrics.sh synthetic --exclude-recovery-models
+```
+
+The option also works with `create_prediction_metrics.sh`. It filters model
+selection; `--no-recovery` instead disables recovery events within the selected
+trained models.
+
 Both modes use `--only-missing`. By default, full prediction/event parquets are
 temporary; small score/annotation caches under `metrics/.cache/` allow reports
 and plots to be rebuilt without repeating inference. Synthetic runs do not save

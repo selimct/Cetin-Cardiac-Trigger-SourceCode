@@ -700,8 +700,8 @@ FeatureFramer::FeatureFramer(FeatureFramerConfig config)
     if (config_.ecg_slope_mode == EcgSlopeMode::fast ||
         config_.ecg_slope_mode == EcgSlopeMode::fast_slow)
     {
-        slope_weights_[config_.frame_size_raw] =
-            linear_slope_weights(config_.frame_size_raw);
+        slope_weights_[kFastSlopeWindowSamples] =
+            linear_slope_weights(kFastSlopeWindowSamples);
     }
     if (config_.ecg_slope_mode == EcgSlopeMode::slow ||
         config_.ecg_slope_mode == EcgSlopeMode::fast_slow)
@@ -772,8 +772,8 @@ std::vector<float> FeatureFramer::build_slope_features() const
     }
     if (config_.ecg_slope_mode == EcgSlopeMode::fast)
     {
-        const auto fast1 = window_slope(0, config_.frame_size_raw);
-        const auto fast2 = window_slope(1, config_.frame_size_raw);
+        const auto fast1 = window_slope(0, kFastSlopeWindowSamples);
+        const auto fast2 = window_slope(1, kFastSlopeWindowSamples);
         return {static_cast<float>(fast1), static_cast<float>(fast2)};
     }
     const auto slow1 = window_slope(
@@ -786,8 +786,8 @@ std::vector<float> FeatureFramer::build_slope_features() const
     {
         return {static_cast<float>(slow1), static_cast<float>(slow2)};
     }
-    const auto fast1 = window_slope(0, config_.frame_size_raw);
-    const auto fast2 = window_slope(1, config_.frame_size_raw);
+    const auto fast1 = window_slope(0, kFastSlopeWindowSamples);
+    const auto fast2 = window_slope(1, kFastSlopeWindowSamples);
     return {
         static_cast<float>(fast1),
         static_cast<float>(slow1),
@@ -859,9 +859,10 @@ std::optional<FeatureFrame> FeatureFramer::process_sample(const RawSample &sampl
 
     if (config_.ecg_slope_mode != EcgSlopeMode::none)
     {
-        const auto capacity = std::max(
+        const auto capacity = std::max({
             config_.frame_size_raw,
-            config_.ecg_slope_slow_window_samples);
+            kFastSlopeWindowSamples,
+            config_.ecg_slope_slow_window_samples});
         if (slope_history_.size() == capacity)
         {
             slope_history_.pop_front();

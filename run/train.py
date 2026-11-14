@@ -177,7 +177,8 @@ def live_training(
         ecg2_offset: Offset subtracted from ECG2 before rotation/normalization.
         ecg3_offset: Offset subtracted from measured ECG3 when rotation is off.
         ecg_slope_mode: Frame-level ECG slope features: none, fast, slow, or
-            fast_slow.
+            fast_slow. Fast slopes fit the latest eight raw samples at either
+            frame rate.
         ecg_slope_slow_window_samples: Trailing raw samples in the slow slope fit.
         signal_quality_mode: Optional signal-quality feature: none, ecg, or ecg_puls.
         ecg_rotation_angle: ECG1/ECG2 rotation angle in radians.

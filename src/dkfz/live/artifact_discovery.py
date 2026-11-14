@@ -32,7 +32,15 @@ class ModelArtifact:
         return name in {self.name, self.family, self.family.removesuffix("_cv")}
 
 
-def discover_models(root, *, variant="best", method=None, names=(), missing_ok=False):
+def discover_models(
+    root,
+    *,
+    variant="best",
+    method=None,
+    names=(),
+    missing_ok=False,
+    exclude_recovery=False,
+):
     if method not in (None, *CV_METHODS):
         raise ValueError(f"Unknown CV method: {method}")
     if variant not in {"best", "tuned"}:
@@ -73,13 +81,25 @@ def discover_models(root, *, variant="best", method=None, names=(), missing_ok=F
                 name if directory.name in PUBLISHED_VARIANT_DIRECTORIES else family.name
             )
             artifact = ModelArtifact(name, directory.resolve(), alias, cv_method)
+            if exclude_recovery and (
+                cfg.get("recovery_head")
+                or cfg.get("recovery_only")
+                or directory.name in RECOVERY_DIRECTORIES
+                or name.removesuffix("_cv").endswith(
+                    tuple("_" + kind for kind in RECOVERY_DIRECTORIES)
+                )
+            ):
+                continue
             if not names or any(artifact.matches(value) for value in names):
                 candidates.append(artifact)
     for name in names:
         if not missing_ok and not any(
             artifact.matches(name) for artifact in candidates
         ):
-            raise ValueError(f"No {variant} model found for {name!r} under {root}")
+            kind = "non-recovery " if exclude_recovery else ""
+            raise ValueError(
+                f"No {kind}{variant} model found for {name!r} under {root}"
+            )
     selected = []
     for name in sorted({candidate.name for candidate in candidates}):
         matches = [candidate for candidate in candidates if candidate.name == name]
@@ -144,9 +164,16 @@ def main():
     parser.add_argument("--variant", choices=("best", "tuned"), default="best")
     parser.add_argument("--cv-method", choices=CV_METHODS)
     parser.add_argument("--model", action="append", default=[])
+    parser.add_argument(
+        "--exclude-recovery-models",
+        action="store_true",
+        help="List only normal models, including delayed 100 Hz variants.",
+    )
     args = parser.parse_args()
     try:
         if args.action == "resolve":
+            if args.exclude_recovery_models:
+                parser.error("--exclude-recovery-models requires the list action")
             if len(args.model) != 1:
                 parser.error("resolve requires one --model")
             candidate = resolve_model(
@@ -160,7 +187,11 @@ def main():
         else:
             for root in args.root:
                 for candidate in discover_models(
-                    root, variant=args.variant, method=args.cv_method, names=args.model
+                    root,
+                    variant=args.variant,
+                    method=args.cv_method,
+                    names=args.model,
+                    exclude_recovery=args.exclude_recovery_models,
                 ):
                     print(f"{candidate.name}\t{candidate.directory}")
     except (ValueError, OSError) as error:

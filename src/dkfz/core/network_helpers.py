@@ -47,8 +47,8 @@ class ThresholdSelection:
     sensitivity_efficiency: float
     best_attainable_sensitivity: float
     effective_sensitivity_floor: float
-    metrics: dict[str, float | int]
-    search_rows: tuple[dict[str, float | int | bool | str], ...]
+    metrics: dict[str, float | int | None]
+    search_rows: tuple[dict[str, float | int | bool | str | None], ...]
     fp_threshold: float | None = None
     der_threshold: float | None = None
     recovery_threshold: float | None = None
@@ -170,7 +170,7 @@ def evaluate_threshold_grid(
     outer_error_association_frames: int = 2,
     exact_tolerance_frames: int = 0,
     recovery_threshold: float | None = None,
-) -> tuple[dict[str, float | int | bool | str], ...]:
+) -> tuple[dict[str, float | int | bool | str | None], ...]:
     """Evaluate the live event metrics at every supplied threshold."""
     error_association_frames = int(error_association_frames)
     if error_association_frames < 0:
@@ -193,7 +193,7 @@ def evaluate_threshold_grid(
     ):
         raise ValueError("thresholds must contain finite values between 0 and 1.")
 
-    search_rows: list[dict[str, float | int | bool | str]] = []
+    search_rows: list[dict[str, float | int | bool | str | None]] = []
 
     for th in thresholds:
         pred_peaks = streaming_trigger_peaks(

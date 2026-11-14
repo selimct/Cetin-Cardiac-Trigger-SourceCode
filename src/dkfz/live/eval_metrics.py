@@ -358,8 +358,8 @@ def build_siemens_trigger_metrics_report(
     return report
 
 
-def _pct(value: float) -> str:
-    return f"{100.0 * float(value):.2f}%"
+def _pct(value: float | None) -> str:
+    return "N/A" if value is None else f"{100.0 * float(value):.2f}%"
 
 
 def _offset_label(offset_frames: int, offset_ms: float | None) -> str:

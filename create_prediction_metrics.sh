@@ -16,6 +16,7 @@ METRICS_ROOT="metrics"
 OVERVIEW=""
 ONLY_MISSING=0
 DISABLE_RECOVERY=0
+EXCLUDE_RECOVERY_MODELS=0
 SYNTHETIC_GRADIENT=0
 EXCLUDE_LOW_FREQUENCIES=0
 SAVE_SYNTHETIC=0
@@ -90,6 +91,9 @@ Options:
                              --model accepts the declared name or CV family name.
   --no-recovery             Disable recovery events; keep the current prediction
                              and saved calibration. Reports: current_only/.
+  --exclude-recovery-models Skip recovery model versions entirely, including
+                             frozen and LOPO recovery. Keep normal 50 Hz and
+                             delayed 100 Hz models.
   --only-missing             Skip model/input pairs whose cached predictions,
                              metrics, plots, and event analysis
                              already exist and match the saved model/runtime settings.
@@ -132,6 +136,9 @@ Options:
 Examples:
   # All published normal and recovery models on the six preferred recordings:
   ./metrics.sh normal
+
+  # Only normal 50 Hz and 100 Hz models:
+  ./metrics.sh normal --exclude-recovery-models
 
   # Same recordings with synthetic gradients:
   ./metrics.sh synthetic
@@ -189,6 +196,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-recovery)
       DISABLE_RECOVERY=1
+      shift
+      ;;
+    --exclude-recovery-models)
+      EXCLUDE_RECOVERY_MODELS=1
       shift
       ;;
     --include-outer-position-errors)
@@ -514,6 +525,7 @@ resolve_inputs
 
 discovery_args=(list --root "$MODELS_ROOT" --variant "$MODEL_VARIANT")
 [[ -z "$CV_METHOD" ]] || discovery_args+=(--cv-method "$CV_METHOD")
+[[ "$EXCLUDE_RECOVERY_MODELS" -eq 0 ]] || discovery_args+=(--exclude-recovery-models)
 for model in "${MODELS[@]}"; do
   discovery_args+=(--model "$model")
 done

@@ -24,6 +24,8 @@ Modes:
                             Reports: metrics/synthetic/
 
 Options:
+  --exclude-recovery-models Run only normal 50 Hz and delayed 100 Hz models;
+                            skip all recovery model versions.
   --save-prepped            Keep full prediction/event parquets under metrics/prepped/
                             with the same normal/synthetic/model subdirectories.
                             Default: keep only small report caches; reuse saved
@@ -36,6 +38,7 @@ Options:
 
 Examples:
   ./metrics.sh normal
+  ./metrics.sh normal --exclude-recovery-models
   ./metrics.sh synthetic
   ./metrics.sh normal --save-prepped
   ./metrics.sh synthetic --save-prepped

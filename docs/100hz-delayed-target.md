@@ -31,6 +31,12 @@ history and holdoff durations must be preserved when changing the model rate.
 The default holdoff is 200 ms: 20 frames at 100 Hz or 10 at 50 Hz. Explicit saved
 holdoff settings take precedence.
 
+Fast ECG slopes use the latest eight raw samples (20 ms) at both frame rates,
+updated every frame. At 100 Hz, successive windows overlap by four samples.
+The first frame has zero fast slopes until eight samples are available; resets
+and gaps restart that warmup. Slow slopes retain their trailing raw-sample
+history (40 samples, or 100 ms, by default). Both fits remain causal.
+
 After updating an existing checkout, rebuild both native components:
 
 ```bash

@@ -194,7 +194,7 @@ def compute_event_position_metrics(
     error_association_frames: int = DEFAULT_ERROR_ASSOCIATION_FRAMES,
     outer_error_association_frames: int | None = DEFAULT_OUTER_ERROR_ASSOCIATION_FRAMES,
     exact_tolerance_frames: int = EXACT_TOLERANCE_FRAMES,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | None]:
     """Return configured TP/PE/oPE counts and unique-error metrics.
 
     ``position_error`` consumes one prediction and one target but contributes
@@ -239,7 +239,12 @@ def event_metrics_from_counts(
     outer_error_association_frames=2,
     exact_tolerance_frames=0,
 ):
-    """Recompute pooled rates without counting either positional tier as FP/FN."""
+    """Recompute pooled rates without counting either positional tier as FP/FN.
+
+    Weighted DER is undefined without targets. Keep the error count available
+    and return None for that rate so target-free false positives cannot look
+    like a perfect score or produce non-finite JSON values.
+    """
     c = {key: int(counts.get(key, 0)) for key in EVENT_COUNT_KEYS}
     tp, pe, ope, fp, fn = (
         c[key]
@@ -266,7 +271,7 @@ def event_metrics_from_counts(
         **c,
         "unique_error_count": unique_errors,
         "weighted_error_count": cost,
-        "weighted_detection_error": _safe_ratio(cost, targets),
+        "weighted_detection_error": float(cost / targets) if targets else None,
         "exact_sensitivity": _safe_ratio(tp, targets),
         "exact_positive_predictive_value": _safe_ratio(tp, predicted),
         "unique_detection_error": _safe_ratio(unique_errors, predicted),
