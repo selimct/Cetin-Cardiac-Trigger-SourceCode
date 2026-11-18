@@ -165,6 +165,11 @@ _PREDICTION_CONFIG_SECTIONS = (
             "puls_clip",
             "align_to_puls_blocks",
             "verify_puls_constant_within_block",
+            "synthetic_gradient",
+            "synthetic_main_frequency_hz",
+            "synthetic_noise_multiplier",
+            "synthetic_lead_phase_deg",
+            "synthetic_independent_leads",
         ),
     ),
     (

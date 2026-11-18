@@ -31,6 +31,7 @@ from dkfz.live.training_config import (  # noqa: E402
     TRAINING_DEFAULTS,
     load_training_config_values,
     training_kwargs_from_config_and_values,
+    require_recovery_training_opt_in,
 )
 
 
@@ -145,6 +146,7 @@ def resolve_hpo_training_kwargs(
 ) -> dict:
     explicit = {
         "config": args.config,
+        "recovery_models": getattr(args, "recovery_models", False),
         "plots": getattr(args, "plots", None),
         "prediction_mode": getattr(args, "prediction_mode", None),
         "prediction_delay_frames": getattr(args, "prediction_delay_frames", None),
@@ -184,6 +186,7 @@ def resolve_hpo_training_kwargs(
         explicit,
         config_values=config_values,
     )
+    require_recovery_training_opt_in(kwargs, explicit)
     kwargs["base_modelname"] = cv_base_modelname(str(kwargs["modelname"]))
     kwargs["modelname"] = cv_modelname(str(kwargs["modelname"]))
     kwargs["cv_method"] = "nested_lopo_hpo"

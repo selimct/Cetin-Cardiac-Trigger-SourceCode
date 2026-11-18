@@ -3,19 +3,20 @@
   "num_trials": 4,
   "seed": 42,
   "baseline": {
-    "name": "current_default",
+    "name": "delayed_100hz_default",
     "parameters": {
       "lr": 0.002884760125018128,
       "hidden_dim": 64,
       "num_layers": 2,
-      "window_size": 50
+      "window_size": 100
     }
   },
   "fixed": {
     "batch_size": 256,
     "num_epochs": 35,
     "threshold_objective": "min_error",
-    "threshold_sensitivity_efficiency": 0.95
+    "threshold_sensitivity_efficiency": 0.95,
+    "recovery_head": false
   },
   "search_space": {
     "lr": {
@@ -25,15 +26,24 @@
     },
     "hidden_dim": {
       "type": "categorical",
-      "values": [32, 64]
+      "values": [
+        32,
+        64
+      ]
     },
     "num_layers": {
       "type": "categorical",
-      "values": [1, 2]
+      "values": [
+        1,
+        2
+      ]
     },
     "window_size": {
       "type": "categorical",
-      "values": [25, 50]
+      "values": [
+        50,
+        100
+      ]
     }
   },
   "selection": {

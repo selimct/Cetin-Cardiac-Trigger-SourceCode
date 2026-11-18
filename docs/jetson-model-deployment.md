@@ -1,4 +1,4 @@
-# Prepare a 50 Hz or delayed 100 Hz model on the Jetson
+# Jetson deployment and qualification
 
 Run all commands from the project root, `/home/orin/work/live_stack`, using
 `/home/orin/envs/jet/bin/python`. Preparation needs an idle detector and no
@@ -6,9 +6,14 @@ concurrent training or GPU validation. The commands refuse an active or
 unverified detector service; they never stop it. No physical UART/GPIO is opened
 by model preparation, and no power or clock setting is changed.
 
-For the combined parity, fixed-threshold accuracy and service-profile checks,
-use the [single qualification script](model-qualification.md). It includes
-paced and GPIO-disabled live UART checks without production activation.
+After [receiving a delayed 100 Hz model](#receive-the-finished-model), use
+[qualification](#qualify-a-finished-model) for parity, held-out accuracy, and
+service-context timing against a 50 Hz baseline. For standard 50 Hz models or
+individual diagnostic steps, use [manual bundle preparation](#build-an-isolated-bundle)
+and [processing measurements](#measure-sustained-processing).
+Review the [service profile](#worker-scheduling-profile)
+before installation, then [activate the validated model](#activate-the-validated-model)
+after accepting accuracy, timing, and hardware results.
 
 ## Receive the finished model
 
@@ -35,6 +40,146 @@ same channel definition. `--ecg3-source ecg2_minus_ecg1` explicitly confirms thi
 and derives the third channel in temporary parity inputs. A saved recording's
 independently measured `ecg3_raw` is not assumed equivalent. Source recordings
 and annotations remain unchanged.
+
+## Qualify a finished model
+
+For a delayed 100 Hz candidate and its 50 Hz baseline, run the combined
+qualification entrypoint from the project root as the ordinary user:
+
+```bash
+bash run/qualify_model.sh \
+  --model-dir finished_models/ecg3/delayed_100hz \
+  --parity-input data/live/p05/p05_out.parquet \
+  --test-input data/live/p12/p12_out.parquet \
+  --uart-recording data/pmu/raw/uart/p13/p13_out.bin \
+  --ecg3-source ecg2_minus_ecg1
+```
+
+Replace the example model/recording paths with your selected finished model,
+validation recording(s), and genuinely held-out annotated test recording(s).
+Repeat `--parity-input` and `--test-input` for more coverage. The baseline defaults
+to `finished_models/ecg3`; select another with `--baseline-dir`. Best/tuned source
+variants have separate `--variant` and `--baseline-variant` options. The selected
+config supplies the model identity automatically.
+
+The source model must be the separately trained four-sample delayed model, with
+`best.pth` plus matching `train_config.json` (or the corresponding tuned pair).
+Finish transferring it before running the script. CUDA checkpoint tensors are
+loaded on CPU for export/reference inference; training need not be restarted.
+The model must use the confirmed ECG2 − ECG1 lead definition.
+
+First inspect the plan by adding `--dry-run`. It reads model metadata but performs
+no GPU work, authentication, service operation or output-directory creation.
+The default output is a new `artifact/qualification-<timestamp>-<id>/`; an explicit
+`--output-dir` must also be a new directory under this project's `artifact/`.
+Run `bash run/qualify_model.sh --help` for all options.
+
+### What runs
+
+1. **Implementation and engine parity.** Rebuild the existing native build only
+   as needed. Development regression suites are maintained upstream and
+   are not bundled in this public distribution; the report records
+   `development_regressions.status=not_bundled`. Copy
+   the exact model into a new isolated bundle, export ONNX and build TensorRT on
+   this Jetson. Compare Torch/ONNX/TRT on causal recording-derived feature windows,
+   then Torch/native probabilities, event positions and emission coordinates over
+   the parity recordings. An additional real-signal fixture exercises an index
+   gap, sequence change, independent warmups and partial EOF. FP16 that changes
+   numerical/event results is rejected; automatic precision retries strict FP32.
+   Positive trigger coverage is required. No synthetic trained model is used.
+
+2. **Fixed-weight accuracy comparison.** Run the finished 50 Hz baseline and new
+   candidate on the same held-out inputs and common valid interval after warmup.
+   Temporary input copies derive ECG3 without unsigned subtraction wraparound;
+   original signals/annotations remain untouched. Weights and saved thresholds
+   are unchanged. The controlled comparison uses a common physical holdoff based
+   on the candidate's saved duration, rounded up to a representable 20 ms grid.
+   If rounding would change the candidate, a separate saved-policy evaluation
+   supplies its acceptance metrics. No source config is edited. Native early
+   emission policy is taken from the production runtime config. Reports include
+   recovered/new misses, added/removed false positives, timing error, sample-axis
+   emission latency, boundary positions and premature-trigger/holdoff cases.
+   Schema-4 frame categories (100 Hz 0–1/2–3/4–5; 50 Hz 0/1/2) remain separate
+   from the shared ±20 ms raw-time diagnostic.
+
+3. **Complete service scheduling/sandbox checks.** By default run two paced
+   612-second tests, then a 60-second live UART check with **GPIO disabled**.
+   Each uses a uniquely named transient `dkfz-qualification-...` service,
+   production User/Group/supplementary groups, CPU/IO weights, nice priority,
+   timer slack, bounded RT limits, watchdog and filesystem protection. Actual
+   manager properties, process identity and verified RR/20 worker states are
+   checked; requested flags alone are insufficient. The checkout is read-only
+   in the service. A read-only Python-environment bind supports the test driver.
+   The driver gives readiness/watchdog ownership to the native child explicitly.
+
+The temporary unit uses [systemd-run](https://www.freedesktop.org/software/systemd/man/249/systemd-run.html) and substitutes private writable `/run` state, diagnostic JSONL,
+no automatic restart and a private PTY for paced input. The live check uses the
+UART device from `config/native_uart_live.conf`; connect valid live input before
+running it. Raw capture and external threshold polling are disabled in private
+config copies. The production detector must already be idle; the script refuses
+active or unverified detector/process activity and never stops that detector.
+It does not install/reload/start the production service, activate a deployment,
+change power/clocks, retrain, change annotations, or tune thresholds. Measure
+physical GPIO timing separately.
+
+Timing reports include p50/p95/p99/max processing and host-decode-to-completion,
+CPU/GPU stages, backlog, deadlines, sample counts, valid-input/reset/loss counters,
+positive output coverage, temperatures and unchanged power mode. Native deadline
+limits start at host decode; source-pacer delays are reported separately. This
+is not a proof of a universal worst-case bound. Power watts may be unavailable.
+
+### Authentication and duration
+
+The script always uses `/home/orin/envs/jet/bin/python`. Do **not** run the entire
+script under sudo. It prompts for sudo authentication for the private service
+jobs and cleanup of their exact, generated `/run` directories; another prompt
+may occur when a long phase outlasts the credential cache. No password is stored
+or passed as a command argument. Export/build and offline comparison run as you;
+service tests run as the production service account.
+
+Allow at least 21–22 minutes for the default timing checks, plus engine building,
+full-recording CPU accuracy inference. `--timing-runs 1` runs one
+sustained test; `--seconds` cannot be below 600. `--live-uart-seconds 0` explicitly
+skips the physical UART access/liveness check and leaves qualification for review.
+`--accuracy-limit-seconds N` limits the evaluated prefix and records that scope;
+use full held-out recordings for the final assessment. Keep the machine under
+representative background activity; do not run unrelated GPU benchmarks.
+
+### Acceptance and results
+
+The default timing budget is zero native missed deadlines and at most eight
+samples of completion backlog. Every test must consume the expected sample and
+evaluation counts without invalid input/reset/loss (a bounded initial
+synchronization prefix is allowed only for live UART), retain the required
+worker scheduling and exercise positive triggers. Override the timing budgets only if
+that is an explicitly accepted operating requirement.
+
+Accuracy limits are **not invented by the tool**. Supply your agreed bounds:
+
+```text
+--min-sensitivity FRACTION --max-fp-per-minute RATE
+--max-emission-latency-ms MILLISECONDS   # optional additional bound
+```
+
+These are acceptance checks on fixed results, not threshold selection. Without
+both primary accuracy bounds, all checks still run but the result is
+`review_required`. Held-out status is declared by the caller; the tool does not
+prove the provenance of the training/test split.
+
+Read `qualification_report.md` for the summary and `qualification_report.json`
+for complete hashes, acceptance states and per-stage evidence. `accuracy/`
+contains the paired raw/frame results and event/probability logs; `prepared/`
+contains the Jetson bundle; `service-*` contains each timing/context/thermal run.
+Original model, recording, service-config, deployed-pair, relevant source-code
+and built native-binary hashes are checked again on exit. Code edits during a
+run invalidate its result. The report records the commit, working-tree state
+and target software versions. A failure retains its evidence and prevents a
+passing report.
+
+Exit statuses are **0 passed**, **1 failed/error**, **2 CLI usage error**, and
+**3 checks completed but review is required**. A dry run exits 0. Nothing is
+activated after success. New weights or changed runtime/service settings need
+new qualification rather than reuse of an old report.
 
 ## Build an isolated bundle
 
@@ -122,32 +267,96 @@ The frame-end anchor is **host UART decode time**, not the physical acquisition
 edge. Stage CPU time excludes waiting/descheduling; CUDA event time can include
 interleaved GPU work. Use these together to localize stalls. They do not identify
 an OS thread, interrupt or driver operation responsible for a historical stall.
-The optimized native engine uses persistent pinned host buffers, startup warmup,
-a nonblocking CUDA stream and CUDA graph launch when capture succeeds. Engines
-that cannot be captured retain normal enqueue, following
-[NVIDIA's capture/fallback guidance](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/performance/optimization.html#cuda-graphs).
 For an isolated diagnostic comparison, `DKFZ_DISABLE_CUDA_GRAPH=1` forces normal
-enqueue without editing the model or deployment. GPU stage timing is enabled with
-`--emit-probabilities`; it adds measurement overhead.
+enqueue without editing the model or deployment. GPU stage timing is enabled
+with `--emit-probabilities`; it adds measurement overhead.
 
 Production health diagnostics also retain `missed_frame_deadlines` and
-`max_frame_end_to_completion_ns` when probability output is disabled. The installed service's original `Nice=-5`/CPU weight policy differs from a
-direct shell benchmark's normal scheduling. The repository now also stages a
-[bounded worker scheduling profile](service-latency.md), which needs privileged
-paced qualification before installation. Neither is a hard real-time guarantee.
+`max_frame_end_to_completion_ns` when probability output is disabled. A direct
+shell benchmark does not reproduce the
+[service scheduling profile](#worker-scheduling-profile); use qualification to
+measure the service context.
 
 The installed power/clock policy is only queried. A Linux/CUDA system without
 additional scheduling guarantees does not acquire a hard worst-case bound from
 one successful run. For physical GPIO latency, measure input and output edges
 with suitable hardware before enabling physical triggering.
 
-## Accuracy and activation
+### Live UART processing
 
-Every transferred model needs its own validation/test review, without
-threshold tuning on held-out recordings. Comparisons between models
-trained on different data do not isolate the effect of framing.
-Use metric schema 4: absolute 100 Hz offsets 0–1 TP, 2–3 PE, 4–5 oPE; standard
-50 Hz remains 0/1/2. Compare raw annotations on a common time interval separately.
+For a separately validated/prepared model, with the service/direct runtime
+stopped, measure live UART processing without GPIO using:
+
+```bash
+mkdir -p tmp/jetson-latency
+build_native/inference/native_uart_live_runtime \
+    --config config/native_uart_live.conf --manifest "$BUNDLE/model/model.conf" \
+    --trigger-output jsonl --emit-probabilities > tmp/jetson-latency/runtime.jsonl
+
+/home/orin/envs/jet/bin/python run/summarize_inference_latency.py \
+    tmp/jetson-latency/runtime.jsonl
+```
+
+The report includes p50/p95/p99/max processing across all four samples,
+preprocessing, transfers, inference and trigger processing; decoder-frame-end
+to completion latency; backlog; and missed 10 ms deadlines. Startup is included.
+Frame-end latency uses the host `decoded_monotonic_ns` anchor, not the sample
+clock reconstructed from the number of decoded samples. Logs without that
+anchor from older binaries need a new measurement; unpaced replay can place
+reconstructed sample times in the future and previously reported zero delay.
+GPIO runs additionally log host decision-to-assertion timing. Verify physical
+input/output edges independently. Unpaced byte replay cannot validate sustained
+100 Hz operation.
+
+## Worker scheduling profile
+
+`deploy/dkfz-native-uart-live.service` supplies a candidate profile that must
+be qualified on the target before installation:
+
+| Setting | Purpose |
+| --- | --- |
+| `--realtime-priority 20 --require-realtime` | Acquisition, inference and output workers request and verify `SCHED_RR` priority 20. |
+| `CPUSchedulingPolicy=other` | Main/CUDA initialization and supervision retain normal scheduling. |
+| `LimitRTPRIO=20` | Permits the bounded worker priority without granting `CAP_SYS_NICE`. |
+| `LimitRTTIME=200ms` | Limits continuous real-time CPU use by a worker that stops blocking normally. |
+| `CPUWeight=1000` | Gives normal-priority runtime/helper work more weight under CPU contention; no CPU quota is added. |
+| `TimerSlackNSec=1000` | Reduces timer coalescing for the service. |
+
+Existing `Nice=-5`, watchdogs, GPIO configuration, source calibration and model
+settings are retained. No power/clock policy, global scheduler knob or CPU
+isolation/pinning is changed. No whole-model memory lock is requested.
+
+Only the three application workers explicitly promote themselves after CUDA
+initialization. `worker_scheduling` diagnostics report requested/actual policy
+and priority, named threads, whether real-time scheduling was applied, and any
+failure. Required startup waits for all three scheduling checks before sending
+systemd readiness. Missing process limits or an unavailable worker scheduler
+fail with configuration status 2, preventing a restart loop under the unit's
+existing `RestartPreventExitStatus=2`.
+
+Standalone runs preserve the inherited scheduler by default:
+`realtime_priority=0`, `require_realtime=false`. This preserves existing 50 Hz
+and isolated replay behavior. An optional priority request logs degradation and
+continues if the bounded prerequisites or permissions are missing. A required
+request fails instead. Priorities outside 0–20, required priority zero, and
+unbounded/zero required RT CPU limits are rejected. Read-only `--validate-only`
+checks prerequisites; it does not change scheduling or open UART/GPIO.
+
+`LimitRTTIME` bounds continuous RT CPU use, **not** the maximum completion delay
+of a frame. RT scheduling does not eliminate interrupts, kernel/driver waits,
+priority inversion or device stalls. Qualify the installed kernel and driver
+stack before relying on its timing. See the
+[Linux scheduling reference](https://man7.org/linux/man-pages/man7/sched.7.html)
+and [systemd execution settings](https://www.freedesktop.org/software/systemd/man/249/systemd.exec.html).
+Measure this profile with the [qualification workflow](#qualify-a-finished-model)
+before installing the service template.
+
+## Activate the validated model
+
+Evaluate each model on held-out recordings using saved validation-selected
+thresholds. Review accuracy under metric schema 4 and compare raw annotations
+on a common time interval separately; see the
+[100 Hz metric policy](100hz-delayed-target.md#tp-pe-and-ope-definitions-option-2).
 
 For old training runs, recomputing current validation metrics from saved scores
 is distinct from selecting a different best epoch/checkpoint. An older run that
@@ -172,7 +381,9 @@ not start the service. Starting physical input/output remains a separate action.
 
 ## Older 50 Hz models
 
-Current-frame behavior remains the default. Both Python runtime configuration
+Current-frame 50 Hz models remain supported when explicitly selected.
+They retain their saved frame rate and target contract; new training defaults
+to delayed 100 Hz. Both Python runtime configuration
 and the native manifest reader accept saved preprocessing contract 3 for the
 existing 400 Hz/eight-sample model with default quality histories (10/200
 frames). The original version marker is preserved; it is not rewritten to 4.

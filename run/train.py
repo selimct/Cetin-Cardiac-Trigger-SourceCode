@@ -22,9 +22,12 @@ including ECG column names, pulse usage, frame size, normalization settings, and
 ECG rotation angle. A config can also be passed back into this script with
 `--config`; explicit CLI arguments override config values.
 
+New models default to a delayed 100 Hz primary output without recovery. Use
+--prediction-mode current for fresh 50 Hz training; explicit saved configurations
+retain their model contract. Recovery requires an explicit opt-in.
 By default, training reads all rows from `data/live/p*/*`, while checkpoint and
 threshold selection use all rows from `data/live/sp*/*`. Use
-`--save-prepped` to cache the slow 400 Hz to 50 Hz preprocessing step, and
+`--save-prepped` to cache the 400 Hz to 100 Hz preprocessing step, and
 `--use-prepped` to train from that cache when preprocessing settings have not
 changed.
 """
@@ -49,6 +52,7 @@ from dkfz.live.training_config import (
     TRAINING_DEFAULTS,
     load_training_config_values,
     training_kwargs_from_config_and_values,
+    require_recovery_training_opt_in,
 )
 from dkfz.live.training_pipeline import (
     DebugTimer,
@@ -130,6 +134,7 @@ def live_training(
     plots: bool | None = None,
     threshold_inputs: list[str] | None = None,
     recovery_head: bool | None = None,
+    recovery_models: bool = False,
     recovery_max_fp_increase: float | None = None,
     recovery_min_extra_fp_per_minute: float | None = None,
     cache_frozen_recovery: bool | None = None,
@@ -215,6 +220,7 @@ def live_training(
         explicit_values,
         config_values=config_values,
     )
+    require_recovery_training_opt_in(kwargs, explicit_values)
     inputs = kwargs["inputs"]
     modelname = kwargs["modelname"]
     lr = float(kwargs["lr"])
@@ -572,7 +578,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Maximum distance used only to attribute a non-exact prediction as "
-            "one position error. Exact-match tolerance is always zero."
+            "one position error. Exact tolerance follows the model's frame-rate policy."
         ),
     )
     parser.add_argument(

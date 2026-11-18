@@ -198,6 +198,11 @@ def main():
     from dkfz.live.training_config import add_training_plot_arguments
 
     add_training_plot_arguments(parser)
+    parser.add_argument(
+        "--recovery-models",
+        action="store_true",
+        help="Required opt-in to recovery-only training.",
+    )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--modelname", required=True)
@@ -234,6 +239,8 @@ def main():
     source.add_argument("--patient-root")
     source.add_argument("--patient-manifest")
     args = parser.parse_args()
+    if not args.recovery_models:
+        parser.error("Recovery training is excluded by default; pass --recovery-models")
     output = args.output_dir or default_cv_output_dir(
         args.modelname, NESTED_RECOVERY_LOPO_DIRNAME
     )

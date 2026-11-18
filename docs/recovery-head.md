@@ -22,7 +22,9 @@ Run this after updating an existing installation, before using the native trigge
 
 ## Train a two-output model
 
-The current training approach implemented by `train_models_lopo.sh` is:
+Recovery training is opt-in. Select `./train_models_lopo.sh recovery`; plain
+`./train_models_lopo.sh` trains delayed 100 Hz models without recovery.
+The joint recovery workflow is:
 
 1. Load each model's architecture and preprocessing settings from its recipe. Train
    the shared LSTM and both output heads from new random weights.
@@ -40,15 +42,15 @@ The current training approach implemented by `train_models_lopo.sh` is:
    epoch, and train the final model on all supplied patients. Publish it under
    `finished_models/MODEL/recovery/`.
 
-This is the default workflow of the wrapper. The `recovery-only` subcommand
+This is the explicit `recovery` workflow of the wrapper. The `recovery-only` subcommand
 instead adds a recovery head to frozen source weights.
 
-The root training wrapper trains fresh two-output models for `ecg3`,
+The explicit recovery mode trains fresh two-output models for `ecg3`,
 `slope_ecg3`, `slope_slow_ecg3`, `slope_ecg3_cqm4ecg` and
 `slope_slow_ecg3_cqm4ecg`. It reads architecture and preprocessing settings from
-each model's `config/lopo_recipes/MODEL.json`. These recipes preserve the settings
-from the original finished models and do not depend on saved checkpoints or
-output directories. Use `--recipe-dir DIR` to select another recipe directory.
+each model's `config/lopo_recipes/MODEL.json`. The recipes store delayed 100 Hz
+settings; the recovery preset converts their histories to the 50 Hz current-frame
+rate. Recipes are independent of saved checkpoints and output directories. Use `--recipe-dir DIR` to select another recipe directory.
 The explicit `--lr 0.001`
 in `build_training_command` in `train_models_lopo.sh` overrides each recipe's
 learning rate; edit that value to adjust LR for all these jobs.
@@ -56,17 +58,17 @@ The LSTM and both heads start with
 new weights. Outputs use separate `_recovery` names:
 
 ```bash
-./train_models_lopo.sh --dry-run
+./train_models_lopo.sh recovery --dry-run
 ```
 
 Remove `--dry-run` to train all five models sequentially. Use `--only ecg3`
-(repeatable) to select a subset. `--recovery-head` remains accepted but is
-already enabled by default. Source checkpoints and preprocessing caches are
-not reused. Each recipe's `configured_max_epochs` restores the original search
+(repeatable) to select a subset. `--recovery-head` remains an alternative explicit opt-in to joint recovery.
+Source checkpoints and preprocessing caches are not reused. Each recipe's `configured_max_epochs` restores the original search
 budget (35 for these models), rather than its previously selected duration.
 `--num-epochs` overrides that maximum; the base seed defaults to 42.
 
-The wrapper can start with both `models/` and `finished_models/` absent or empty.
+In recovery mode the wrapper can start with both `models/` and
+`finished_models/` absent or empty.
 Keep `config/lopo_recipes/` and the raw annotated recordings. It recreates training
 outputs under `models/MODEL_recovery_cv/nested_lopo/` and publishes the final
 weights and matching config under `finished_models/MODEL/recovery/`. Only these
@@ -77,8 +79,8 @@ itself.
 To allow up to four overlapping jobs with at least 20 minutes between starts:
 
 ```bash
-./train_models_lopo.sh --parallel 4 --start-delay-minutes 20 --dry-run
-./train_models_lopo.sh --parallel 4 --start-delay-minutes 20
+./train_models_lopo.sh recovery --parallel 4 --start-delay-minutes 20 --dry-run
+./train_models_lopo.sh recovery --parallel 4 --start-delay-minutes 20
 ```
 
 The earliest starts are 0, 20, 40, 60 and 80 minutes after the first launch,
@@ -111,7 +113,7 @@ Enable the architecture with `--recovery-head`:
 
 ```bash
 .venv/bin/python run/train_lopo.py \
-  --modelname slope_ecg3_recovery \
+  --modelname slope_ecg3_recovery --prediction-mode current \
   --config config/lopo_recipes/slope_ecg3.json \
   --patient-root data/live \
   --recovery-head \
@@ -135,8 +137,8 @@ To add a frozen recovery head to every model in `finished_models/`, use the
 root script:
 
 ```bash
-./train_finished_models_recovery.sh --dry-run
-./train_finished_models_recovery.sh
+./train_finished_models_recovery.sh --recovery-models --dry-run
+./train_finished_models_recovery.sh --recovery-models
 ```
 
 It runs ten recovery-only epochs per source model, calibrates with a default
@@ -152,22 +154,11 @@ training length, or `--recovery-max-fp-increase` to change the allowance.
 The saved data/validation split is reused; keep the six benchmark recordings
 for the independent comparison afterward.
 
-CPU recovery-only training caches the frozen LSTM representations and current
-logits once per training call, including validation. Later epochs train only the
-recovery head. This is enabled by default for the standard deterministic float32
-CPU model and datasets, for both the saved-split and nested LOPO workflows. The
-cache lives in RAM for that call; source checkpoints and fold data are never
-reused across calls. Short final batches use the original forward path to retain
-their original numerical kernels; single-epoch jobs also use the original path.
-The original weights, two-output loss, optimizer, shuffled batch order,
-validation/checkpoint selection, and saved checkpoint format stay
-the same. Small floating-point differences from batching remain possible.
-
-GPU training, custom/stochastic models or datasets, and representation caches
-over 512 MiB use the original path. To explicitly compare with the original CPU
-implementation, add `--no-cache-frozen-recovery` to
+CPU recovery-only training caches deterministic frozen representations in RAM
+by default. GPU/custom models, single-epoch jobs, and caches over 512 MiB use
+the regular forward path. Disable caching with `--no-cache-frozen-recovery` on
 `train_finished_models_recovery.sh`, `run/train_finetune.py`, or
-`run/train_recovery_lopo.py`. No native rebuild is needed.
+`run/train_recovery_lopo.py`.
 
 The output names distinguish the training modes:
 
@@ -212,8 +203,8 @@ run is not automatically a patient-held-out evaluation.
 Use patient-wise nested recovery selection instead of the within-recording split:
 
 ```bash
-./train_finished_models_recovery.sh --lopo --dry-run
-./train_finished_models_recovery.sh --lopo
+./train_finished_models_recovery.sh --recovery-models --lopo --dry-run
+./train_finished_models_recovery.sh --recovery-models --lopo
 ```
 
 The main training wrapper also accepts
@@ -261,7 +252,7 @@ fold, as in normal model training.
 ```bash
 ./create_train_metrics.sh models --cv-method nested_recovery_lopo
 
-.venv/bin/python run/train_recovery_lopo.py \
+.venv/bin/python run/train_recovery_lopo.py --recovery-models \
   --config finished_models/ecg3/train_config.json \
   --checkpoint finished_models/ecg3/best.pth \
   --modelname ecg3_lopo_recovery --num-epochs 10
@@ -417,17 +408,10 @@ for preparation. Both prediction and preparation accept
 `--cv-method nested_recovery_lopo` (or the corresponding normal/HPO method) to
 resolve ambiguous nested runs; preparation also accepts an exact `--model-dir`.
 
-Training overviews include the recovery threshold (`disabled` when calibration
-keeps it off), and CSV/JSON reports retain the recovery settings. The
-`create_prediction_metrics.sh` wrapper automatically evaluates the configured
-combined detector. Its `--only-missing` cache checks include checkpoint contents,
-runtime configuration, input identity, and prediction arguments. Training settings
-and calibration audit metadata do not invalidate predictions; changing the selected
-recovery threshold does. Inference code and the installed native extension are
-included in prediction keys. Plot settings and plotting dependencies have a separate
-key, so plot changes reuse predictions while rebuilding plots.
-Legacy single-output caches can still be reused, but recovery
-models require a matching key and rerun old predictions on first use.
+Training overviews and CSV/JSON reports retain the recovery settings. Use
+`--recovery-models` to include these models in the prediction benchmark;
+add `--no-recovery` for a current-only comparison. See the
+[metrics guide](metrics.md) for selection, cache reuse, and report policies.
 
 ONNX exports one tensor named `logit`, shaped `[batch, 2]`. The order is current,
 then previous. Old models retain their scalar-per-window output and checkpoint
@@ -442,7 +426,7 @@ For the fine-tuned example:
   --modelname slope_ecg3_frozen_recovery --model-variant tuned
 
 ./create_prediction_metrics.sh models \
-  --model slope_ecg3_frozen_recovery --model-variant tuned \
+  --recovery-models --model slope_ecg3_frozen_recovery --model-variant tuned \
   data/true/p02/p02_head.parquet \
   data/true/p14/p14_heart.parquet data/true/p14/p14_head.parquet \
   data/true/p16/p16_head.parquet data/true/p16/p16_heart.parquet \
@@ -462,5 +446,5 @@ target frame.
 
 Enabling the architecture alone is not evidence of reduced misses. Train and
 calibrate it, then compare FN/FP and emission timing on the six preferred
-recordings and their configured gradient variants. Existing finished models
-are not modified or activated by adding this implementation.
+recordings and their configured gradient variants. Use the
+[deployment guide](jetson-model-deployment.md) to qualify and activate the result.

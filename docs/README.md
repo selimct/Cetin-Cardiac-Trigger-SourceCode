@@ -8,7 +8,9 @@
 
 This project detects ECG R-peaks for real-time cardiac triggering in
 ultra-high-field MRI. It includes tools to prepare recordings, train and evaluate
-models, and run a trained model on a Jetson Orin Nano.
+models, and run a trained model on a Jetson Orin Nano. New training and
+automatic model comparisons default to delayed 100 Hz; 50 Hz and recovery
+models require explicit selection. Existing deployments keep their saved contract.
 
 During live operation, the Jetson receives ECG and pulse samples over UART,
 processes them with a TensorRT model, and produces GPIO trigger pulses. The live
@@ -20,7 +22,10 @@ on the desktop to deploy models and operate the Jetson over SSH.
 - **Using an existing model:** continue below.
 - **Building your own model:** follow [Training](training.md).
 - **Operating without the GUI:** see [Terminal alternatives](terminal.md).
-- **Optional 100 Hz model:** see [previous-frame prediction](100hz-delayed-target.md).
+- **Compare model predictions:** see [Metrics and synthetic benchmarks](metrics.md).
+- **Prepare and qualify on the Jetson:** see [Deployment and qualification](jetson-model-deployment.md).
+- **Recovery models:** see [Previous-frame recovery](recovery-head.md).
+- **Default 100 Hz model:** see [previous-frame prediction](100hz-delayed-target.md).
 
 Examples use `my_model_cv`, produced by
 the [LOPO training workflow](training.md) with base name `my_model`. Replace the
@@ -43,7 +48,6 @@ live_stack/
 ├── data/                    Recordings and prepared datasets
 │   └── live/                Annotated dataset repository, grouped by patient
 ├── models/                  Training outputs, configurations, and predictions
-├── notebooks/               Exploration and analysis
 ├── build_native/            Generated native executables
 └── docs/                    User guides and terminal alternatives
 ```
@@ -243,4 +247,3 @@ while triggering is stopped. Development regression suites are maintained upstre
 | Inference is paused | Check patient/lead connections and signal validity; recovery needs fresh input. |
 | Events appear but no physical pulse | Check GPIO mapping, line ownership, polarity, and the receiving device. |
 | Threshold change has no effect | Refresh **Detector controls** and inspect request status and the confirmed policy. |
-

@@ -38,7 +38,7 @@ from dkfz.live.model_variants import (  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--modelname", default="target_r")
+    parser.add_argument("--modelname", default="ecg3_delayed_100hz")
     parser.add_argument(
         "--model-variant", choices=MODEL_VARIANT_CHOICES, default="best"
     )

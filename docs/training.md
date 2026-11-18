@@ -15,7 +15,7 @@ Recordings → raw-rate parquet → reviewed R-peak annotations
 
 The model learns to detect R-peaks from ECG and, by default, pulse input.
 Training applies the causal preprocessing used for live prediction, converting
-400 Hz raw samples into 50 Hz model features. Supply raw-rate recordings; the
+400 Hz raw samples into delayed 100 Hz model features. Supply raw-rate recordings; the
 training script builds the features and model windows. Use
 [`run/train_lopo.py`](../run/train_lopo.py) for nested leave-one-patient-out
 (LOPO) training and evaluation.
@@ -41,36 +41,51 @@ the plotting dependencies from the training extras. For example:
 /home/orin/envs/jet/bin/python run/train.py --help  # lists --plots / --no-plots
 ```
 
-The default trigger holdoff is 200 ms: `min_distance=10` at the standard 50 Hz
-model rate. The LOPO recipes use this value, and inference without an explicit
-holdoff uses 200 ms. Saved configs with an explicit `holdoff_frames` or
-`holdoff_ms` continue to take precedence; for example, an existing config with
-`holdoff_frames=20` still requests 400 ms at 50 Hz. Threshold calibration uses
-the configured holdoff.
+New training defaults to a single delayed 100 Hz primary output: four raw
+samples per frame, a 100-frame one-second window, and one subsequent frame of
+context. The default holdoff is 200 ms (`min_distance=20`). Saved configurations
+retain their declared timing, architecture, and explicit holdoff settings.
 
-For an optional second output that recovers the previous frame using one extra
-frame of context, see [previous-frame recovery](recovery-head.md). The existing
-single-output architecture remains the default.
+The recipe wrapper trains and publishes the five delayed model families:
 
-For a single primary output trained at 100 Hz with one subsequent frame of
-context, see [100 Hz previous-frame prediction](100hz-delayed-target.md).
-It uses four-sample frames and separately trained weights; the existing 50 Hz
-workflow remains the default. The guide includes the preset, cache contract,
-GUI behavior and raw-time comparison against 50 Hz and 100 Hz controls.
-Use `./train_models_lopo.sh delayed-100hz --only ecg3 --dry-run` to preview the
-training/publication workflow for `finished_models/ecg3/delayed_100hz/`.
-The 100 Hz metric policy is TP at ±0–1 frame, PE at ±2–3 and oPE at ±4–5.
-The normal model retains TP at the same frame, PE at ±1 and oPE at ±2.
-Metrics schema 4 records these radii; see the guide before comparing reports
-or recalibrating a model trained with the older 100 Hz metric policy.
+```bash
+./train_models_lopo.sh --dry-run
+./train_models_lopo.sh --parallel 2 --start-delay-minutes 0
+```
 
-For the current five-model workflow, use
-[fresh two-output nested LOPO training](recovery-head.md#train-a-two-output-model)
-through `./train_models_lopo.sh`. The wrapper fixes the architecture settings in
-`config/lopo_recipes/`,
-uses a shared learning rate, and calibrates the primary and recovery thresholds
-in two stages. These recipes are independent of the output directories, so this
-workflow can start with empty `models/` and `finished_models/` directories.
+`delayed-100hz` remains an alias for the default. Use `normal` to explicitly
+train 50 Hz current-frame models (`min_distance=10` for the same 200 ms holdoff):
+
+```bash
+./train_models_lopo.sh normal --only ecg3 --dry-run
+```
+
+To train ECG3 without pulse input at 100 Hz:
+
+```bash
+./train_models_lopo.sh delayed-100hz --only ecg3 --nopuls
+```
+
+`--nopuls` overrides the recipe's `not_use_puls` setting without editing it.
+The run is named `ecg3_nopuls_delayed_100hz`, with training outputs under
+`models/ecg3_nopuls_delayed_100hz_cv/nested_lopo/`, published artifacts under
+`finished_models/ecg3_nopuls/delayed_100hz/`, and a separate metrics overview at
+`models/lopo_nopuls_delayed_100hz_metrics_overview.txt`. The flag also works
+with the wrapper's `normal` and joint `recovery` modes.
+
+Direct Python training defaults to delayed 100 Hz too. Select
+`--prediction-mode current` for fresh 50 Hz training, or explicitly provide an
+existing 50 Hz configuration. See the [100 Hz guide](100hz-delayed-target.md)
+for targets, physical histories, publication paths, and the frame-tier metric
+policy. Use new model names when changing an existing model's target contract.
+
+Recovery is excluded by default. Joint recovery requires
+`./train_models_lopo.sh recovery` (or `--recovery-head`); frozen recovery scripts
+require `--recovery-models`. The Python training entrypoints also require an
+explicit `--recovery-models`, `--recovery-head`, or `--recovery-only` when a source
+configuration enables recovery. See [recovery training](recovery-head.md).
+The wrapper's learning rate, seed, and epoch budget remain defined by its options
+and the recipes in `config/lopo_recipes/`.
 
 Preprocessing is versioned separately through `preprocessing_contract_version`,
 currently **4**. The Python extension and native runtime share the same version
@@ -99,8 +114,9 @@ Use Python 3.10 or 3.11 and a C++ build toolchain. From a fresh checkout:
 bash setup.sh --profile workstation
 ```
 
-This creates or reuses `.venv`, installs the training/export dependencies, builds
-the shared native processing code. Development tests are not bundled. Use `.venv/bin/python`
+This creates or reuses `.venv`, installs the training/export dependencies, and
+builds the shared native processing code. Development tests are not bundled.
+Use `.venv/bin/python`
 for subsequent Python commands. A workstation build can run without TensorRT;
 the deployment engine is built on the Jetson.
 
@@ -254,7 +270,8 @@ the deployed system's physical timing.
 The final `best.pth` has seen all supplied patients. Running it on those same
 recordings is useful for inspection, but its results are not held-out test
 performance. For additional independent evaluation, use new patients with the
-[offline prediction command](README.md#use-a-model-on-a-recording).
+[offline prediction command](README.md#use-a-model-on-a-recording) and
+[metrics guide](metrics.md).
 
 ## Deploy the result
 

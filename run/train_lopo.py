@@ -34,6 +34,7 @@ from dkfz.live.training_config import (  # noqa: E402
     TRAINING_DEFAULTS,
     load_training_config_values,
     training_kwargs_from_config_and_values,
+    require_recovery_training_opt_in,
 )
 from dkfz.live.training_reuse import (  # noqa: E402
     check_run_available,
@@ -43,6 +44,8 @@ from dkfz.live.training_reuse import (  # noqa: E402
     training_request,
 )
 from dkfz.live.training_seed import validate_training_seed  # noqa: E402
+
+sys.stdout.reconfigure(line_buffering=True, write_through=True)
 
 
 def _setting(value: str):
@@ -192,6 +195,7 @@ def resolve_lopo_training_kwargs(args: argparse.Namespace) -> dict:
     explicit.update(
         {
             "config": args.config,
+            "recovery_models": getattr(args, "recovery_models", False),
             "recovery_head": getattr(args, "recovery_head", None),
             "recovery_max_fp_increase": getattr(args, "recovery_max_fp_increase", None),
             "recovery_min_extra_fp_per_minute": getattr(
@@ -223,6 +227,7 @@ def resolve_lopo_training_kwargs(args: argparse.Namespace) -> dict:
         explicit,
         config_values=config_values,
     )
+    require_recovery_training_opt_in(kwargs, explicit)
     # Parser defaults use None for "unspecified", but --set NAME=null is an
     # explicit request to clear a saved setting, such as a manual threshold.
     kwargs.update(

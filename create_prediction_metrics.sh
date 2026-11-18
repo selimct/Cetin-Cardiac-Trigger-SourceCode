@@ -5,6 +5,7 @@
 
 set -uo pipefail
 
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 PYTHON_BIN=".venv/bin/python"
 PREDICT_SCRIPT="run/offline_predict.py"
 PLOT_SCRIPT="run/create_prediction_plots.py"
@@ -15,12 +16,16 @@ MODELS_ROOT=""
 METRICS_ROOT="metrics"
 OVERVIEW=""
 ONLY_MISSING=0
+JOBS=1
+APPEND=0
+WORKER_RECORDS=""
 DISABLE_RECOVERY=0
-EXCLUDE_RECOVERY_MODELS=0
+EXCLUDE_RECOVERY_MODELS=1
+INCLUDE_50HZ_MODELS=0
 SYNTHETIC_GRADIENT=0
 EXCLUDE_LOW_FREQUENCIES=0
 SAVE_SYNTHETIC=0
-SAVE_PREPPED=0
+SAVE_PREPPED=1
 THRESHOLD_STEP="0.001"
 MAX_ERROR_PLOTS="12"
 ERROR_WINDOW_FRAMES="25"
@@ -41,9 +46,10 @@ each model/input pair, writes fixed-threshold dashboard and error-example PDFs,
 then creates per-model pooled dashboards, all-input overviews, and a comparison of every
 model against the siemens_tr baseline. The configured threshold is evaluated
 but is never reselected or changed.
-Two-output models automatically use their configured recovery threshold. Logs
-and fixed-threshold dashboards include the recovery output; no extra flag is needed.
-Use --no-recovery to evaluate only the current output of the same trained model.
+Automatic selection defaults to non-recovery 100 Hz models. Include 50 Hz with
+--include-50hz or select one by name. Add --recovery-models for recovery;
+two-output models then use their configured recovery threshold automatically.
+Use --recovery-models --no-recovery to evaluate only their current output.
 Those reports go under <output-dir>/current_only/ for comparison with recovery.
 
 By default every artifact is written under the project's metrics/ folder, with one
@@ -51,8 +57,9 @@ flat subdirectory named exactly after each model:
 
   metrics/<modelname>/...
 
-Full prediction/event parquets are temporary unless --save-prepped is given.
-Saved parquets go under metrics/prepped/ with the same subdirectory layout.
+Full prediction/event parquets are saved by default under metrics/prepped/
+with the same subdirectory layout. These directories are excluded from Git.
+Use --no-save-prepped to retain only compact caches and reports.
 Small score/annotation caches in metrics/.cache/ allow metrics and plots to be
 rebuilt without repeating inference. Existing saved parquets are reused.
 
@@ -81,8 +88,16 @@ Options:
   --output FILE              Overview table path. Default:
                              <output-dir>/prediction_metrics_overview.txt
                              A companion .csv is always written.
-  --model MODEL              Only run one model. Repeatable.
-                             Default: every model directory with artifacts.
+  --model MODEL              Only run one model. Repeatable. Naming a 50 Hz
+                             model explicitly opts into that model.
+                             Default: non-recovery 100 Hz models with artifacts.
+  --include-50hz       Also include 50 Hz models in automatic selection.
+  --add-model MODEL          Evaluate this model and merge it into existing
+                             comparison tables, preserving other models. Repeatable.
+                             Use the same inputs and benchmark settings.
+  --jobs N                   Run up to N recordings concurrently (default: 1).
+                             Workers share the selected CUDA GPU when available.
+                             Each worker needs additional VRAM and host memory.
   --model-variant VARIANT    Model variant passed to offline_predict.py.
                              Default: best
   --cv-method METHOD        Select nested_lopo, nested_lopo_hpo, or
@@ -91,9 +106,9 @@ Options:
                              --model accepts the declared name or CV family name.
   --no-recovery             Disable recovery events; keep the current prediction
                              and saved calibration. Reports: current_only/.
-  --exclude-recovery-models Skip recovery model versions entirely, including
-                             frozen and LOPO recovery. Keep normal 50 Hz and
-                             delayed 100 Hz models.
+  --recovery-models          Include recovery, frozen recovery, and LOPO recovery
+                             versions alongside normal 50 Hz and delayed 100 Hz models.
+                             Default: exclude all recovery models.
   --only-missing             Skip model/input pairs whose cached predictions,
                              metrics, plots, and event analysis
                              already exist and match the saved model/runtime settings.
@@ -101,17 +116,20 @@ Options:
                              do not invalidate predictions. Inference/native
                              changes do; plotting changes rebuild plots only.
                              Recovery models require a matching cache key;
-                             older single-output caches remain usable.
-  --save-prepped             Keep full prediction/event parquets under
+                             older unmarked single-output caches remain usable
+                             for clean recordings only.
+  --save-prepped             Keep full prediction/event parquets (default) under
                              <output-dir>/prepped/, preserving subdirectories.
                              Matching saved files are reused with --only-missing.
+  --no-save-prepped          Keep only compact report caches; full prediction/event
+                             parquets are temporary for this run.
   --include-outer-position-errors
                              Include outer position errors in overview metrics
                              and columns. Default: count each as FP + FN.
                              Also works with cached predictions (--only-missing).
   --synthetic-gradient      Evaluate main peaks at 190, 90, 80, 40, 20, 10 Hz,
                              aliasing above Nyquist.
-                             Add noise independently (seed 42), then calculate
+                             Couple gradient peak phases at -30 degrees (seed 42), then calculate
                              ecg3_syn = ecg2_syn - ecg1_syn. Predictions use
                              ecgN_syn; raw ECG columns remain unchanged.
                              Artifacts go under
@@ -120,6 +138,13 @@ Options:
                              under <output-dir>/synthetic/ and its model folders.
   --exclude-low-frequencies Omit the 20 Hz and 10 Hz configurations from the sweep.
                              Requires --synthetic-gradient.
+  -- --synthetic-noise-multiplier VALUE
+                             Scale added noise only (metrics default 0.6).
+                             Use a separate --output-dir for each strength.
+  -- --synthetic-lead-phase-deg VALUE
+                             ECG2 peak phase relative to ECG1; default -30 degrees.
+  -- --synthetic-independent-leads
+                             Reproduce historical independent lead noise.
   --save-synthetic          Also save each modified input to
                              data/synthetic/main_<frequency>hz/pNN/<stem>_synthetic.parquet.
                              Includes raw ECGs and ecg1_syn/ecg2_syn/ecg3_syn.
@@ -134,17 +159,17 @@ Options:
                              for rare manual overrides.
 
 Examples:
-  # All published normal and recovery models on the six preferred recordings:
+  # Published non-recovery models on the six preferred recordings:
   ./metrics.sh normal
 
-  # Only normal 50 Hz and 100 Hz models:
-  ./metrics.sh normal --exclude-recovery-models
+  # Include recovery versions:
+  ./metrics.sh normal --recovery-models
 
   # Same recordings with synthetic gradients:
   ./metrics.sh synthetic
 
-  # Also keep full prediction/event parquets:
-  ./metrics.sh synthetic --save-prepped
+  # Keep only compact caches and reports:
+  ./metrics.sh synthetic --no-save-prepped
 
   ./create_prediction_metrics.sh finished_models 'data/test/p04/*.parquet'
 
@@ -180,6 +205,22 @@ while [[ $# -gt 0 ]]; do
       MODELS+=("$(basename "$2")")
       shift 2
       ;;
+    --add-model)
+      [[ $# -ge 2 ]] || die "--add-model requires a model name"
+      MODELS+=("$(basename "$2")")
+      APPEND=1
+      shift 2
+      ;;
+    --jobs)
+      [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || die "--jobs requires a positive integer"
+      JOBS="$2"
+      shift 2
+      ;;
+    --worker-records)
+      [[ $# -ge 2 ]] || die "--worker-records requires a path"
+      WORKER_RECORDS="$2"
+      shift 2
+      ;;
     --model-variant)
       [[ $# -ge 2 ]] || die "--model-variant requires a value"
       MODEL_VARIANT="$2"
@@ -200,6 +241,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --exclude-recovery-models)
       EXCLUDE_RECOVERY_MODELS=1
+      shift
+      ;;
+    --include-50hz)
+      INCLUDE_50HZ_MODELS=1
+      shift
+      ;;
+    --recovery-models)
+      EXCLUDE_RECOVERY_MODELS=0
       shift
       ;;
     --include-outer-position-errors)
@@ -295,7 +344,8 @@ if [[ "$EXCLUDE_LOW_FREQUENCIES" -eq 1 && "$SYNTHETIC_GRADIENT" -eq 0 ]]; then
 fi
 if [[ "$SYNTHETIC_GRADIENT" -eq 1 ]]; then
   METRICS_ROOT="$METRICS_ROOT/synthetic"
-  PREDICT_ARGS+=(--synthetic-gradient)
+  # Prefix the benchmark default so explicit forwarded overrides win.
+  PREDICT_ARGS=(--synthetic-noise-multiplier 0.6 "${PREDICT_ARGS[@]}" --synthetic-gradient)
 fi
 if [[ "$SAVE_SYNTHETIC" -eq 1 ]]; then
   PREDICT_ARGS+=(--save-synthetic)
@@ -522,10 +572,19 @@ RESOLVED_INPUTS=()
 declare -A SEEN_INPUTS=()
 resolve_inputs
 [[ ${#RESOLVED_INPUTS[@]} -gt 0 ]] || die "no parquet inputs found"
+declare -A OUTPUT_INPUTS=()
+for input in "${RESOLVED_INPUTS[@]}"; do
+  input_stem="$(safe_stem "$input")"
+  [[ -z "${OUTPUT_INPUTS[$input_stem]+x}" ]] || \
+    die "inputs share the output name '$input_stem'; use distinct recording filenames"
+  OUTPUT_INPUTS["$input_stem"]="$input"
+done
 
 discovery_args=(list --root "$MODELS_ROOT" --variant "$MODEL_VARIANT")
 [[ -z "$CV_METHOD" ]] || discovery_args+=(--cv-method "$CV_METHOD")
 [[ "$EXCLUDE_RECOVERY_MODELS" -eq 0 ]] || discovery_args+=(--exclude-recovery-models)
+[[ "$EXCLUDE_RECOVERY_MODELS" -eq 1 ]] || discovery_args+=(--recovery-models)
+[[ "$INCLUDE_50HZ_MODELS" -eq 0 ]] || discovery_args+=(--include-50hz)
 for model in "${MODELS[@]}"; do
   discovery_args+=(--model "$model")
 done
@@ -540,10 +599,10 @@ done <<< "$model_listing"
 [[ ${#MODELS[@]} -gt 0 ]] || \
   die "no $MODEL_VARIANT model artifacts found under $MODELS_ROOT"
 
-mkdir -p "$METRICS_ROOT" "$(dirname "$OVERVIEW")"
-: > "$OVERVIEW"
-RECORDS_FILE="$(mktemp "$METRICS_ROOT/.prediction_metrics_records.XXXXXX")"
-WORK_DIR="$(mktemp -d "$METRICS_ROOT/.prediction_work.XXXXXX")"
+mkdir -p "$METRICS_ROOT" "$(dirname "$OVERVIEW")" "$CACHE_ROOT"
+WORK_DIR="$(mktemp -d "$CACHE_ROOT/prediction_work.XXXXXX")"
+RECORDS_FILE="$WORK_DIR/records.jsonl"
+: > "$RECORDS_FILE"
 cleanup_records() {
   rm -f -- "$RECORDS_FILE"
   rm -rf -- "$WORK_DIR"
@@ -553,6 +612,74 @@ trap cleanup_records EXIT
 exit_status=0
 declare -A SUCCESSFUL_PREDICTIONS=()
 
+if [[ -z "$WORKER_RECORDS" ]]; then
+  settings_args=(settings --output "$WORK_DIR/settings.json" --variant "$MODEL_VARIANT")
+  [[ ${#OVERVIEW_ARGS[@]} -eq 0 ]] || settings_args+=(--include-outer-position-errors)
+  for input in "${RESOLVED_INPUTS[@]}"; do settings_args+=(--input "$input"); done
+  for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
+    [[ -z "$main_frequency" ]] || settings_args+=(--frequency "$main_frequency")
+  done
+  if ! PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -m dkfz.live.metrics_execution \
+      "${settings_args[@]}" -- "${PREDICT_ARGS[@]}"; then
+    die "could not prepare benchmark settings"
+  fi
+  if [[ "$APPEND" -eq 1 ]]; then
+    if ! "$PYTHON_BIN" "$OVERVIEW_SCRIPT" --records "$RECORDS_FILE" \
+        --metrics-root "$METRICS_ROOT" --overview-text "$OVERVIEW" \
+        --requested-input-files "${#RESOLVED_INPUTS[@]}" "${OVERVIEW_ARGS[@]}" \
+        --run-settings "$WORK_DIR/settings.json" --append --check-existing; then
+      die "existing results cannot be extended with these settings"
+    fi
+  fi
+fi
+
+if [[ "$JOBS" -gt 1 && -z "$WORKER_RECORDS" ]]; then
+  worker_args=(--python "$PYTHON_BIN" --output-dir "$ARTIFACT_ROOT"
+    --model-variant "$MODEL_VARIANT" --threshold-step "$THRESHOLD_STEP"
+    --max-error-plots "$MAX_ERROR_PLOTS" --error-window-frames "$ERROR_WINDOW_FRAMES")
+  [[ -z "$CV_METHOD" ]] || worker_args+=(--cv-method "$CV_METHOD")
+  [[ "$ONLY_MISSING" -eq 0 ]] || worker_args+=(--only-missing)
+  [[ "$EXCLUDE_RECOVERY_MODELS" -eq 1 ]] || worker_args+=(--recovery-models)
+  [[ "$INCLUDE_50HZ_MODELS" -eq 0 ]] || worker_args+=(--include-50hz)
+  [[ "$DISABLE_RECOVERY" -eq 0 ]] || worker_args+=(--no-recovery)
+  [[ "$SYNTHETIC_GRADIENT" -eq 0 ]] || worker_args+=(--synthetic-gradient)
+  [[ "$EXCLUDE_LOW_FREQUENCIES" -eq 0 ]] || worker_args+=(--exclude-low-frequencies)
+  [[ "$SAVE_SYNTHETIC" -eq 0 ]] || worker_args+=(--save-synthetic)
+  if [[ "$SAVE_PREPPED" -eq 1 ]]; then
+    worker_args+=(--save-prepped)
+  else
+    worker_args+=(--no-save-prepped)
+  fi
+  for model in "${MODELS[@]}"; do worker_args+=(--model "$model"); done
+  parallel_args=(parallel --jobs "$JOBS" --records "$RECORDS_FILE"
+    --work-dir "$WORK_DIR/workers" --script "$SCRIPT_PATH")
+  for input in "${RESOLVED_INPUTS[@]}"; do parallel_args+=(--input "$input"); done
+  if ! PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -m dkfz.live.metrics_execution \
+      "${parallel_args[@]}" -- "${worker_args[@]}" "$MODELS_ROOT" -- "${FORWARDED_PREDICT_ARGS[@]}"; then
+    exit_status=1
+  fi
+  while IFS=$'\t' read -r model input_stem main_frequency; do
+    artifact_dir="$METRICS_ROOT"
+    relative_dir=""
+    [[ -z "$main_frequency" ]] || artifact_dir+="/main_${main_frequency}hz"
+    artifact_dir+="/$model"
+    relative_dir="${artifact_dir#"$ARTIFACT_ROOT"/}"
+    output_base="compare${OUTPUT_SUFFIX}_${input_stem}"
+    SUCCESSFUL_PREDICTIONS["$artifact_dir/$output_base"]="$CACHE_ROOT/$relative_dir/prediction_all_events_${output_base}.arrow"
+  done < <("$PYTHON_BIN" - "$RECORDS_FILE" <<'PY'
+import json
+from pathlib import Path
+import sys
+for line in Path(sys.argv[1]).read_text().splitlines():
+    record = json.loads(line)
+    if record['system_type'] == 'model':
+        stem = Path(record['input']).stem
+        stem = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in stem).strip('._') or 'input'
+        frequency = record.get('main_frequency_hz')
+        print(record['system'], stem, '' if frequency is None else f'{frequency:g}', sep='\t')
+PY
+  )
+else
 for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
   CONFIG_METRICS_ROOT="$METRICS_ROOT"
   CONFIG_PREDICT_ARGS=()
@@ -629,8 +756,9 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
       cache_matches=0
       if [[ -f "$cache_stamp" ]]; then
         [[ "$(<"$cache_stamp")" == "$cache_key" ]] && cache_matches=1
-      elif [[ "$output_mode" == "single" ]]; then
-        # Retain compatibility with pre-feature single-output cached reports.
+      elif [[ "$output_mode" == "single" && "$SYNTHETIC_GRADIENT" -eq 0 ]]; then
+        # Unmarked synthetic caches cannot establish the noise strength/mode.
+        # Retain legacy single-output cache compatibility for clean runs only.
         cache_matches=1
       fi
 
@@ -658,7 +786,13 @@ for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
         prediction_reused=1
       else
         echo "Running $model on $input_name ($output_mode)" >&2
-        rm -f -- "$cache_stamp" "$plot_stamp"
+        # Missing stamps permit legacy single-output caches. Keep an explicit
+        # incomplete marker so a failed refresh cannot adopt stale files later.
+        printf '%s\n' incomplete > "$cache_stamp"
+        printf '%s\n' incomplete > "$plot_stamp"
+        if [[ "$SAVE_PREPPED" -eq 1 ]]; then
+          printf '%s\n' incomplete > "$saved_stamp"
+        fi
         if "$PYTHON_BIN" "$PREDICT_SCRIPT" \
           "$input" \
           --modelname "$model" \
@@ -714,6 +848,7 @@ PY
           printf '%s\n' "$plot_key" > "$plot_stamp"
         else
           echo "Creating fixed-threshold plots for $model on $input_name" >&2
+          printf '%s\n' incomplete > "$plot_stamp"
           if "$PYTHON_BIN" "$PLOT_SCRIPT" \
             --prediction-log "$analysis_log" \
             --config "$config" \
@@ -787,6 +922,17 @@ PY
     fi
   done
 
+done # gradient configurations (one unmodified pass for clean predictions)
+fi
+
+if [[ -n "$WORKER_RECORDS" ]]; then
+  cp -- "$RECORDS_FILE" "$WORKER_RECORDS" || exit 1
+  exit "$exit_status"
+fi
+
+for main_frequency in "${GRADIENT_FREQUENCIES[@]}"; do
+  CONFIG_METRICS_ROOT="$METRICS_ROOT"
+  [[ -z "$main_frequency" ]] || CONFIG_METRICS_ROOT+="/main_${main_frequency}hz"
   for model in "${MODELS[@]}"; do
     artifact_dir="$CONFIG_METRICS_ROOT/$model"
     pooled_args=()
@@ -815,17 +961,20 @@ PY
     fi
   done
 
-done # gradient configurations (one unmodified pass for clean predictions)
+done # pooled dashboards
 
 if [[ ! -s "$RECORDS_FILE" ]]; then
   echo "No successful prediction metrics were available for an overview" >&2
   exit 1
 fi
 
+merge_args=(--run-settings "$WORK_DIR/settings.json")
+[[ "$APPEND" -eq 0 ]] || merge_args+=(--append)
 if ! "$PYTHON_BIN" "$OVERVIEW_SCRIPT" \
     --records "$RECORDS_FILE" \
     --metrics-root "$METRICS_ROOT" \
     --overview-text "$OVERVIEW" \
+    "${merge_args[@]}" \
     "${OVERVIEW_ARGS[@]}" \
     --requested-input-files "${#RESOLVED_INPUTS[@]}"; then
   echo "Could not create pooled prediction metrics overviews" >&2

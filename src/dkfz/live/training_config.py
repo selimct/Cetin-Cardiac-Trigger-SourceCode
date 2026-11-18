@@ -17,7 +17,7 @@ from dkfz.live.prediction_contract import (
     PREDICTION_MODES,
 )
 
-TRAINING_DEFAULTS = {
+CURRENT_TRAINING_DEFAULTS = {
     "prediction_mode": "current",
     "prediction_delay_frames": 0,
     "signal_quality_puls_flat_window_frames": 10,
@@ -84,6 +84,22 @@ TRAINING_DEFAULTS = {
     "plots": None,
 }
 
+# New models use the delayed primary. Keep the legacy preset for explicitly
+# selected current-frame training and for saved configurations without timing metadata.
+TRAINING_DEFAULTS = dict(
+    CURRENT_TRAINING_DEFAULTS,
+    prediction_mode="delayed_100hz",
+    prediction_delay_frames=1,
+    modelname="target_r_delayed_100hz",
+    frame_size_raw=4,
+    window_size=100,
+    min_distance=20,
+    error_association_frames=3,
+    puls_norm_window_frames=1000,
+    signal_quality_puls_flat_window_frames=20,
+    signal_quality_puls_median_window_frames=400,
+)
+
 
 def load_training_config_values(config: str | None) -> dict[str, Any]:
     """Load compatible training settings from a saved JSON configuration."""
@@ -116,7 +132,30 @@ def training_kwargs_from_config_and_values(
         else config_values
     )
 
-    kwargs = dict(TRAINING_DEFAULTS)
+    legacy = cfg.get("prediction_mode") is None and (
+        any(
+            key in cfg
+            for key in (
+                "frame_size_raw",
+                "window_size",
+                "min_distance",
+                "puls_norm_window_frames",
+                "holdoff_frames",
+                "holdoff_ms",
+            )
+        )
+        or cfg.get("recovery_head")
+        or cfg.get("recovery_only")
+    )
+    mode = values.get("prediction_mode") or cfg.get("prediction_mode")
+    if mode is None:
+        mode = "current" if legacy or values.get("recovery_head") else "delayed_100hz"
+    source_current = (
+        legacy
+        or cfg.get("prediction_mode") == "current"
+        or (mode == "current" and cfg.get("prediction_mode") != "delayed_100hz")
+    )
+    kwargs = dict(CURRENT_TRAINING_DEFAULTS if source_current else TRAINING_DEFAULTS)
     kwargs.update(
         {
             key: cfg[key]
@@ -135,6 +174,7 @@ def training_kwargs_from_config_and_values(
     inputs = values.get("inputs") or cfg.get("inputs") or TRAINING_DEFAULTS["inputs"]
     kwargs["inputs"] = inputs
     kwargs["config"] = values.get("config")
+    kwargs["prediction_mode"] = mode
     apply_training_prediction_mode(kwargs, cfg, values)
     from dkfz.live.event_matching import tp_tolerance_frames
 
@@ -167,7 +207,25 @@ def training_kwargs_from_config_and_values(
     return kwargs
 
 
+def require_recovery_training_opt_in(kwargs, explicit):
+    """Reject implicit recovery from a saved config before training writes files."""
+    if (kwargs.get("recovery_head") or kwargs.get("recovery_only")) and not (
+        explicit.get("recovery_models")
+        or explicit.get("recovery_head")
+        or explicit.get("recovery_only")
+    ):
+        raise ValueError(
+            "Recovery training is excluded by default; pass --recovery-models "
+            "or --recovery-head to opt in explicitly."
+        )
+
+
 def add_recovery_training_arguments(parser, *, fine_tune=False):
+    parser.add_argument(
+        "--recovery-models",
+        action="store_true",
+        help="Explicitly allow recovery training from a saved configuration.",
+    )
     parser.add_argument(
         "--recovery-min-extra-fp-per-minute",
         type=float,

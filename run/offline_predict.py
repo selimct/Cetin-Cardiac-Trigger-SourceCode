@@ -22,12 +22,17 @@ selected model variant config: `models/<modelname>/train_config.json` for
 Runtime CLI arguments can override paths, threshold/holdoff, and input
 column/time mapping.
 
-``--synthetic-gradient`` adds independent notebook noise to ECG1/ECG2 and
+``--synthetic-gradient`` adds notebook-shaped noise to ECG1/ECG2 and
 stores them in ecg1_syn/ecg2_syn, then derives ecg3_syn = ecg2_syn - ecg1_syn
 before live preprocessing. Predictions use these columns; raw ECGs are kept. The
 seed 42 is fixed; the sample rate comes from the model config.
+Gradient peak phases are coupled with ECG2 at -30 degrees relative to ECG1,
+approximating measured head artifacts. Each lead's power spectrum is retained.
+``--synthetic-independent-leads`` restores the historical independent draws.
 ``--synthetic-main-frequency-hz`` shifts peaks relative to the main frequency
-and aliases out-of-band components. ``--save-synthetic`` additionally writes the modified
+and aliases out-of-band components. ``--synthetic-noise-multiplier`` scales all
+added components together (default 1); raw ECG amplitudes are unchanged.
+``--save-synthetic`` additionally writes the modified
 input to ``data/synthetic/[main_<frequency>hz/]pNN/<stem>_synthetic.parquet``.
 The input file is preserved. Default prediction output names gain
 ``_synthetic``; explicit output paths are used as supplied.
@@ -76,6 +81,7 @@ from dkfz.live.prediction_logs import build_prediction_log
 from dkfz.live.runtime_config import effective_recovery_threshold
 from dkfz.core.model import ECG_RNN
 from dkfz.core.gradient_noise import (
+    BENCHMARK_LEAD_PHASE_DEGREES,
     GRADIENT_MAIN_FREQUENCIES_HZ,
     SYNTHETIC_ECG_COLUMNS,
     apply_synthetic_gradient,
@@ -91,7 +97,7 @@ PREDICTION_RUNTIME_DEFAULTS = {
     "out_log": None,
     "include_input_name_in_outputs": True,
     "threshold": None,
-    "modelname": "target_r",
+    "modelname": "ecg3_delayed_100hz",
     "model_variant": "best",
     "model_dir": None,
     "holdoff_frames": None,
@@ -112,6 +118,10 @@ PREDICTION_RUNTIME_DEFAULTS = {
     "skip_metrics": False,
     "synthetic_gradient": False,
     "synthetic_main_frequency_hz": None,
+    "synthetic_noise_multiplier": 1.0,
+    # Keep defaults literal for the prediction-cache contract parser.
+    "synthetic_lead_phase_deg": -30.0,
+    "synthetic_independent_leads": False,
     "save_synthetic": False,
 }
 
@@ -229,6 +239,10 @@ def _prediction_config_resolution_from_values(values: dict):
     output_prefix = input_output_prefix(values, kwargs)
     if kwargs["synthetic_gradient"]:
         output_prefix += "_synthetic"
+        if not kwargs["synthetic_independent_leads"]:
+            output_prefix += f"_leads_phase_{float(kwargs['synthetic_lead_phase_deg'])}"
+        if kwargs["synthetic_noise_multiplier"] != 1:
+            output_prefix += f"_noise_x{float(kwargs['synthetic_noise_multiplier'])}"
         if kwargs["synthetic_main_frequency_hz"] is not None:
             output_prefix += "_" + gradient_config_id(
                 kwargs["synthetic_main_frequency_hz"]
@@ -291,6 +305,9 @@ def _live_predict_one(
     save_synthetic: bool = False,
     skip_metrics: bool = False,
     disable_recovery: bool = False,
+    synthetic_noise_multiplier: float = 1.0,
+    synthetic_lead_phase_deg: float = BENCHMARK_LEAD_PHASE_DEGREES,
+    synthetic_independent_leads: bool = False,
 ):
     """Run a trained live ECG model over one parquet file.
 
@@ -327,12 +344,17 @@ def _live_predict_one(
         skip_metrics: Skip evaluation statistics even when annotations exist.
         disable_recovery: Emit events from the current output only, retaining
             the checkpoint's two-output shape and saved recovery calibration.
-        synthetic_gradient: Apply the notebook's gradient noise to ECG1/ECG2
+        synthetic_gradient: Apply notebook-shaped gradient noise to ECG1/ECG2
             before preprocessing, with seed 42, then derive
             ecg3_syn = ecg2_syn - ecg1_syn. Predictions consume ecgN_syn columns
             while original ECG columns and the model's input count stay unchanged.
         synthetic_main_frequency_hz: Optional main peak frequency; TR_ms is
             4000 / frequency. Moves dependent peaks and simulates aliasing.
+        synthetic_noise_multiplier: Scale all added noise components together.
+            One retains the notebook amplitudes; zero adds no noise.
+        synthetic_lead_phase_deg: ECG2 phase relative to ECG1 in gradient peak
+            bands. Default -30 degrees approximates measured head artifacts.
+        synthetic_independent_leads: Restore historical independent lead draws.
         save_synthetic: Also save the modified recording, including derived ECG3,
             as data/synthetic/pNN/<stem>_synthetic.parquet, preserving the source.
             Requires synthetic_gradient.
@@ -341,6 +363,13 @@ def _live_predict_one(
         raise ValueError("--save-synthetic requires --synthetic-gradient")
     if synthetic_main_frequency_hz is not None and not synthetic_gradient:
         raise ValueError("--synthetic-main-frequency-hz requires --synthetic-gradient")
+    if synthetic_noise_multiplier != 1 and not synthetic_gradient:
+        raise ValueError("--synthetic-noise-multiplier requires --synthetic-gradient")
+    if (
+        synthetic_independent_leads
+        or synthetic_lead_phase_deg != BENCHMARK_LEAD_PHASE_DEGREES
+    ) and not synthetic_gradient:
+        raise ValueError("Synthetic lead options require --synthetic-gradient")
     resolution = _prediction_config_resolution_from_values(locals())
     kwargs = resolution.values
     out_events = kwargs["out_events"]
@@ -411,6 +440,10 @@ def _live_predict_one(
             columns=(ecg1_col, ecg2_col),
             fs=raw_hz,
             main_frequency_hz=synthetic_main_frequency_hz,
+            noise_multiplier=synthetic_noise_multiplier,
+            lead_phase_degrees=(
+                None if synthetic_independent_leads else synthetic_lead_phase_deg
+            ),
         )
         ecg1_col, ecg2_col = SYNTHETIC_ECG_COLUMNS[:2]
         ecg3_col = SYNTHETIC_ECG_COLUMNS[2] if ecg3_col is not None else None
@@ -431,11 +464,12 @@ def _live_predict_one(
 
     if synthetic_gradient:
         print(
-            "Applied notebook synthetic gradient noise "
-            f"to {actual_ecg1_col}, {actual_ecg2_col} (seed=42, fs={raw_hz:g} Hz); "
+            "Applied synthetic gradient noise "
+            f"to {actual_ecg1_col}, {actual_ecg2_col} "
+            f"(seed=42, fs={raw_hz:g} Hz, multiplier={synthetic_noise_multiplier:g}); "
             "derived ecg3_syn = ecg2_syn - ecg1_syn; original ECG columns retained"
         )
-        if synthetic_main_frequency_hz is not None:
+        if "synthetic_gradient" in df.attrs:
             print(
                 "Synthetic gradient configuration: "
                 + json.dumps(df.attrs["synthetic_gradient"])
@@ -580,6 +614,9 @@ def live_predict(
     save_synthetic: bool = False,
     skip_metrics: bool = False,
     disable_recovery: bool = False,
+    synthetic_noise_multiplier: float = 1.0,
+    synthetic_lead_phase_deg: float = BENCHMARK_LEAD_PHASE_DEGREES,
+    synthetic_independent_leads: bool = False,
 ):
     """Run a trained live ECG model over parquet files, directories, or globs."""
     input_paths, multiple_inputs = resolve_prediction_inputs(
@@ -615,6 +652,9 @@ def live_predict(
             out_metrics=out_metrics,
             synthetic_gradient=synthetic_gradient,
             synthetic_main_frequency_hz=synthetic_main_frequency_hz,
+            synthetic_noise_multiplier=synthetic_noise_multiplier,
+            synthetic_lead_phase_deg=synthetic_lead_phase_deg,
+            synthetic_independent_leads=synthetic_independent_leads,
             save_synthetic=save_synthetic,
             skip_metrics=skip_metrics,
             disable_recovery=disable_recovery,
@@ -689,7 +729,7 @@ if __name__ == "__main__":
         "--synthetic-gradient",
         action="store_true",
         help=(
-            "Add independent notebook gradient noise to ECG1/ECG2 (seed 42), "
+            "Add coupled notebook-shaped gradient noise to ECG1/ECG2 (seed 42), "
             "predict from ecg1_syn/ecg2_syn and derived ecg3_syn, keeping raw ECGs."
         ),
     )
@@ -699,6 +739,24 @@ if __name__ == "__main__":
         choices=GRADIENT_MAIN_FREQUENCIES_HZ,
         default=None,
         help="Main gradient frequency; TR_ms = 4000 / frequency. Requires --synthetic-gradient.",
+    )
+    parser.add_argument(
+        "--synthetic-noise-multiplier",
+        type=float,
+        default=1.0,
+        help="Scale all added synthetic noise (default 1; e.g. 0.5 for half strength). Requires --synthetic-gradient.",
+    )
+    lead_noise_group = parser.add_mutually_exclusive_group()
+    lead_noise_group.add_argument(
+        "--synthetic-lead-phase-deg",
+        type=float,
+        default=BENCHMARK_LEAD_PHASE_DEGREES,
+        help="ECG2 gradient peak phase relative to ECG1 (default -30 degrees; -180 to 180). Requires --synthetic-gradient.",
+    )
+    lead_noise_group.add_argument(
+        "--synthetic-independent-leads",
+        action="store_true",
+        help="Restore historical independent lead noise instead of coupled gradient peak phases.",
     )
     parser.add_argument(
         "--save-synthetic",

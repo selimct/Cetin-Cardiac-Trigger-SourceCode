@@ -25,6 +25,9 @@ ECG_COLUMNS = ("ecg1_raw", "ecg2_raw")
 SYNTHETIC_ECG_COLUMNS = ("ecg1_syn", "ecg2_syn", "ecg3_syn")
 SAMPLE_RATE_HZ = 400.0
 GRADIENT_SEED = 42
+# Rounded from measured head-gradient dominant-line phase offsets. This is a
+# sampled-frequency phase, not a time delay or a universal acquisition model.
+BENCHMARK_LEAD_PHASE_DEGREES = -30.0
 # Exact main frequencies define the configurations.
 GRADIENT_MAIN_FREQUENCIES_HZ = (190, 90, 80, 40, 20, 10)
 
@@ -318,8 +321,9 @@ def add_gaussian_frequency_noise(
     peaks,
     seed=None,
     noise_floor=None,
+    lead_phase_degrees: float | None = None,
 ):
-    """Add independent noise to each selected column and return (frame, noise).
+    """Add gradient noise to selected columns and return (frame, noise).
 
     Every peak must contain ``rms_amplitude_ecg1`` and ``rms_amplitude_ecg2``.
     Amplitudes are selected by the order of ``columns``. Frequencies, widths,
@@ -329,10 +333,22 @@ def add_gaussian_frequency_noise(
 
     This notebook helper leaves unselected columns unchanged. Use
     ``apply_synthetic_gradient`` to also recalculate the dependent ECG3 channel.
+    With lead_phase_degrees, couple phases in configured peak bands while
+    retaining each lead's exact noise power spectrum. Outside these bands the
+    original independent draws remain. None preserves the legacy notebook draw.
     """
     missing = set(columns).difference(ecg_frame.columns)
     if missing:
         raise KeyError(f"Missing ECG columns: {sorted(missing)}")
+    if lead_phase_degrees is not None:
+        lead_phase_degrees = float(lead_phase_degrees)
+        if not np.isfinite(lead_phase_degrees) or not -180 <= lead_phase_degrees <= 180:
+            raise ValueError(
+                "lead_phase_degrees must be finite and between -180 and 180"
+            )
+        if len(columns) != 2:
+            raise ValueError("Coupled gradient noise requires exactly two ECG columns")
+    peaks = list(peaks)
 
     rng = np.random.default_rng(seed)
     noisy_frame = ecg_frame.copy()
@@ -374,6 +390,27 @@ def add_gaussian_frequency_noise(
         added_noise[column] = channel_noise
         noisy_frame[column] = ecg_frame[column].to_numpy(dtype=float) + channel_noise
 
+    if lead_phase_degrees is not None:
+        frequencies = np.fft.rfftfreq(len(ecg_frame), d=1 / fs)
+        spectrum1 = np.fft.rfft(added_noise[columns[0]].to_numpy())
+        spectrum2 = np.fft.rfft(added_noise[columns[1]].to_numpy())
+        coupled = np.zeros(len(frequencies), dtype=bool)
+        for peak in peaks:
+            coupled |= abs(frequencies - float(peak["frequency_hz"])) <= float(
+                peak["width_hz"]
+            )
+        # DC/Nyquist are real; rotating them would change marginal power.
+        coupled[0] = False
+        if len(ecg_frame) % 2 == 0:
+            coupled[-1] = False
+        coupled &= abs(spectrum1) > 0
+        spectrum2[coupled] = abs(spectrum2[coupled]) * np.exp(
+            1j * (np.angle(spectrum1[coupled]) + np.deg2rad(lead_phase_degrees))
+        )
+        noise2 = np.fft.irfft(spectrum2, n=len(ecg_frame))
+        added_noise[columns[1]] = noise2
+        noisy_frame[columns[1]] = ecg_frame[columns[1]].to_numpy(dtype=float) + noise2
+
     return noisy_frame, added_noise
 
 
@@ -383,12 +420,20 @@ def apply_synthetic_gradient(
     columns=ECG_COLUMNS,
     fs: float = SAMPLE_RATE_HZ,
     main_frequency_hz: float | None = None,
+    noise_multiplier: float = 1.0,
+    lead_phase_degrees: float | None = None,
 ) -> pd.DataFrame:
     """Return original columns plus ecg1_syn, ecg2_syn, and derived ecg3_syn.
 
     ``columns`` supplies ECG1 and ECG2 names in that order. Noise uses the
     GRADIENT_PEAKS and seed 42, restarted for each call. main_frequency_hz
     optionally shifts peaks relative to the main frequency and simulates aliasing.
+    noise_multiplier scales only the generated noise, after all random draws,
+    preserving its spectral shape and lead relationship. One retains the
+    notebook amplitudes; zero adds no noise. Use common levels across recordings.
+    lead_phase_degrees couples the peak-band phases of ECG2 relative to ECG1;
+    None retains independent notebook noise. The offline benchmark uses -30
+    degrees by default; this helper keeps its legacy default for notebooks.
     The synthetic columns hold signal plus noise, with
     ecg3_syn = ecg2_syn - ecg1_syn.
     All three are written even for two-input models; existing synthetic
@@ -400,28 +445,52 @@ def apply_synthetic_gradient(
         raise ValueError("Provide two distinct ECG input columns")
     if set(columns).intersection(SYNTHETIC_ECG_COLUMNS):
         raise ValueError("ECG sources must differ from the synthetic output columns")
+    noise_multiplier = float(noise_multiplier)
+    if not np.isfinite(noise_multiplier) or noise_multiplier < 0:
+        raise ValueError("noise_multiplier must be finite and non-negative")
     peaks = (
         GRADIENT_PEAKS
         if main_frequency_hz is None
         else gradient_peaks_for_frequency(main_frequency_hz, fs)
     )
-    noisy_frame, _ = add_gaussian_frequency_noise(
+    _, noise = add_gaussian_frequency_noise(
         frame,
         columns=columns,
         fs=fs,
         peaks=peaks,
         seed=GRADIENT_SEED,
         noise_floor=GRADIENT_NOISE_FLOOR,
+        lead_phase_degrees=lead_phase_degrees,
     )
     result = frame.copy()
     result.attrs.pop("synthetic_gradient", None)
-    result["ecg1_syn"] = noisy_frame[columns[0]]
-    result["ecg2_syn"] = noisy_frame[columns[1]]
+    for source, destination in zip(columns, SYNTHETIC_ECG_COLUMNS[:2]):
+        result[destination] = (
+            frame[source].to_numpy(dtype=float)
+            + noise[source].to_numpy(dtype=float) * noise_multiplier
+        )
     result["ecg3_syn"] = result["ecg2_syn"] - result["ecg1_syn"]
-    if main_frequency_hz is not None:
+    if (
+        main_frequency_hz is not None
+        or noise_multiplier != 1
+        or lead_phase_degrees is not None
+    ):
         result.attrs["synthetic_gradient"] = {
-            "config_id": gradient_config_id(main_frequency_hz),
-            "main_frequency_hz": float(main_frequency_hz),
+            "config_id": (
+                gradient_config_id(main_frequency_hz)
+                if main_frequency_hz is not None
+                else None
+            ),
+            "main_frequency_hz": (
+                float(main_frequency_hz) if main_frequency_hz is not None else None
+            ),
+            "noise_multiplier": noise_multiplier,
+            "lead_phase_degrees": (
+                float(lead_phase_degrees) if lead_phase_degrees is not None else None
+            ),
+            "lead_noise_mode": (
+                "independent" if lead_phase_degrees is None else "coupled_peak_phases"
+            ),
             "sample_rate_hz": float(fs),
             "seed": GRADIENT_SEED,
             "peaks": peaks,
@@ -461,12 +530,20 @@ def save_synthetic_parquet(
 
     Call ``apply_synthetic_gradient`` first to add ecg1_syn/ecg2_syn/ecg3_syn
     alongside the original raw signals. Both versions are saved. A configured
-    main frequency adds its config_id subdirectory; metadata survives in Parquet.
+    main frequency adds its config_id subdirectory; nondefault strength adds a
+    noise_x<multiplier> directory. Metadata survives in Parquet.
     The patient comes from the input filename prefix. The index is preserved,
     directories are created as needed, and an existing synthetic output at the
     same path is replaced. The input path itself is never overwritten.
     """
-    config_id = frame.attrs.get("synthetic_gradient", {}).get("config_id")
+    metadata = frame.attrs.get("synthetic_gradient", {})
+    phase = metadata.get("lead_phase_degrees")
+    if phase is not None:
+        output_root = Path(output_root) / f"leads_phase_{float(phase)}"
+    multiplier = metadata.get("noise_multiplier", 1.0)
+    if multiplier != 1:
+        output_root = Path(output_root) / f"noise_x{float(multiplier)}"
+    config_id = metadata.get("config_id")
     if config_id is not None:
         output_root = Path(output_root) / config_id
     destination = synthetic_output_path(input_path, output_root)

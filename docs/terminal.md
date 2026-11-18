@@ -1,16 +1,16 @@
 <!--
 # Copyright (c) 2026 Furkan Selim Cetin <mail@furkancetin.dev>
-
-For a transferred delayed 100 Hz model, use the [isolated Jetson preparation
-workflow](jetson-model-deployment.md) with `--prepare-only` and real recordings
-before considering activation. Legacy 50 Hz models remain supported.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Developed at the German Cancer Research Center (DKFZ).
 -->
 
 # Terminal alternatives
 
-The optional [100 Hz previous-frame model](100hz-delayed-target.md) uses these
+For a transferred delayed 100 Hz model, use
+[isolated Jetson preparation and qualification](jetson-model-deployment.md)
+before activation. Legacy 50 Hz models remain supported.
+
+The default [100 Hz previous-frame model](100hz-delayed-target.md) uses these
 same preparation commands with a separately trained checkpoint/config pair.
 Its guide covers raw-time comparison and sustained latency telemetry.
 
@@ -105,15 +105,15 @@ startup recovery policy you intend to use. Inspect `validation_report.json`;
 recordings without emitted events do not establish positive trigger coverage.
 
 For sustained service-profile and fixed-weight accuracy checks on a delayed
-100 Hz primary model, follow [model qualification](model-qualification.md).
+100 Hz primary model, follow [model qualification](jetson-model-deployment.md#qualify-a-finished-model).
 Physical UART/GPIO timing requires the separate hardware checks. The public
 distribution does not bundle the development regression suites.
 
 ## Link the service unit
 
-Review and qualify the [worker scheduling profile](service-latency.md) before
-installing the current template. Linking/reloading is a separate deployment
-step performed by the operator after qualification.
+Review and qualify the
+[worker scheduling profile](jetson-model-deployment.md#worker-scheduling-profile)
+before installing the current template. Link and reload it after qualification.
 
 GUI equivalent: **Installed service → Install / repair unit link**.
 Complete the [host provisioning](hardware.md#install-the-service) first.

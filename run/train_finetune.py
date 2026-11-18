@@ -112,6 +112,9 @@ def _resolve_fine_tune_kwargs(values: dict) -> tuple[dict, dict, dict]:
         values,
         config_values=config_values,
     )
+    from dkfz.live.training_config import require_recovery_training_opt_in
+
+    require_recovery_training_opt_in(kwargs, values)
 
     # Fine-tune training length/rate are intentionally independent from the
     # source training config. Only explicit caller/CLI values override these.

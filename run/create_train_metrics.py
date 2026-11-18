@@ -24,6 +24,7 @@ if str(SRC) not in sys.path:
 from dkfz.live.event_matching import METRICS_SCHEMA_VERSION  # noqa: E402
 from dkfz.live.io import repo_relative_path  # noqa: E402
 from dkfz.live.metrics_overview import duration_minutes, format_totals  # noqa: E402
+from dkfz.live.artifact_discovery import is_100hz_model  # noqa: E402
 
 CV_METHODS = ("nested_lopo", "nested_lopo_hpo", "nested_recovery_lopo")
 CONFIGURATION_KEYS = (
@@ -594,7 +595,7 @@ def main() -> int:
         "--cv-method",
         choices=(*CV_METHODS, "all"),
         default="all",
-        help="CV result type to aggregate. Defaults to all, including recovery-head LOPO.",
+        help="CV workflow filter. Model selection defaults to non-recovery 100 Hz runs.",
     )
     parser.add_argument(
         "--model",
@@ -610,6 +611,16 @@ def main() -> int:
             "Overview tables and normalized JSON are still refreshed to include "
             "the current metrics and totals; no training is run."
         ),
+    )
+    parser.add_argument(
+        "--include-50hz",
+        action="store_true",
+        help="Include 50 Hz runs; --model also explicitly selects a named 50 Hz run.",
+    )
+    parser.add_argument(
+        "--recovery-models",
+        action="store_true",
+        help="Include recovery runs, which are excluded by default.",
     )
     args = parser.parse_args()
 
@@ -632,6 +643,22 @@ def main() -> int:
     failures = 0
     for run in runs:
         try:
+            config = _read_json_object(run.config_path)
+            recovery = bool(
+                config.get("recovery_head")
+                or config.get("recovery_only")
+                or run.cv_method == "nested_recovery_lopo"
+                or run.modelname.endswith("_recovery")
+            )
+            if recovery and not args.recovery_models:
+                continue
+            if (
+                not recovery
+                and not args.include_50hz
+                and not args.models
+                and not is_100hz_model(config)
+            ):
+                continue
             records.append(build_training_record(run))
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
             failures += 1
@@ -640,6 +667,11 @@ def main() -> int:
                 file=sys.stderr,
             )
     if not records:
+        print(
+            "No matching training results: defaults select non-recovery 100 Hz runs; "
+            "use --include-50hz or --recovery-models to opt in.",
+            file=sys.stderr,
+        )
         return 1
 
     output_dir = args.output_dir or ROOT / "metrics"

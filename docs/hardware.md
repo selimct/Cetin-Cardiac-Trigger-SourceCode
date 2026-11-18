@@ -79,9 +79,9 @@ restart the service to use the rebuilt executable. The
 
 ## Install the service
 
-The source template now includes a [bounded worker scheduling
-profile](service-latency.md). Rebuild the runtime and qualify that profile before
-installing it. Installing and starting the service are separate operator actions.
+The source template includes a
+[bounded worker scheduling profile](jetson-model-deployment.md#worker-scheduling-profile).
+Rebuild the runtime and qualify that profile before installing it.
 
 The service template runs as `dkfz-live` and reads the checkout through a
 read-only mount at `/opt/dkfz-live`. Before installing it:
@@ -165,4 +165,3 @@ update. `puls_updated` marks that first sample. Native UART/GPIO readout and
 offline UART/GPIO conversion use this same boundary rule. Converted parquets
 record `auxiliary_publication=following-group` in their metadata; regenerate
 older UART-derived parquets from their captures to apply the corrected timing.
-

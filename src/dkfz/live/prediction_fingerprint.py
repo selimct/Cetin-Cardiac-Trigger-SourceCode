@@ -22,6 +22,7 @@ NON_PREDICTION_FILES = {
     "live/recovery.py",
     "live/recovery_calibration.py",
     "live/metrics_overview.py",
+    "live/metrics_execution.py",
     "live/threshold_analysis.py",
     "live/prediction_cache.py",
     "live/prediction_fingerprint.py",

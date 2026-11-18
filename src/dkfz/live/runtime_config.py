@@ -22,7 +22,7 @@ from dkfz.live.model_variants import (
 )
 
 BASE_RUNTIME_DEFAULTS = {
-    "modelname": "target_r",
+    "modelname": "ecg3_delayed_100hz",
     "model_variant": DEFAULT_MODEL_VARIANT,
     "ecg1_col": "ecg1_raw",
     "ecg2_col": "ecg2_raw",

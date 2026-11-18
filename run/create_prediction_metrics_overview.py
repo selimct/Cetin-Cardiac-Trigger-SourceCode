@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import math
@@ -170,6 +171,101 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     if len({record["main_frequency_hz"] is None for record in records}) > 1:
         raise ValueError("Cannot mix clean and gradient-configuration records")
     return records
+
+
+def overview_state_path(metrics_root: Path, overview: Path) -> Path:
+    name = hashlib.sha256(str(overview.resolve()).encode()).hexdigest()[:20]
+    return metrics_root / ".cache" / f"overview_{name}.json"
+
+
+def previous_records(
+    *, metrics_root: Path, overview: Path, settings: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Retain existing comparisons only when their benchmark setup agrees."""
+    state = overview_state_path(metrics_root, overview)
+    if state.exists():
+        data = json.loads(state.read_text(encoding="utf-8"))
+        if data.get("settings") != settings:
+            changed = sorted(
+                k for k in settings if data.get("settings", {}).get(k) != settings[k]
+            )
+            raise ValueError(
+                "Existing benchmark settings differ: "
+                + ", ".join(changed)
+                + ". Use the original settings or a separate --output-dir."
+            )
+        return [normalize_record(record) for record in data["records"]]
+
+    csv_path = per_input_text_path(overview).with_suffix(".csv")
+    if not csv_path.exists():
+        if overview.exists() or overview.with_suffix(".csv").exists():
+            raise ValueError(f"Cannot extend existing results without {csv_path}.")
+        return []
+    # Historical synthetic tables have no provenance for amplitude/lead mode.
+    # Importing them could silently mix the former and current noise defaults.
+    if settings["frequencies"] != [None]:
+        raise ValueError(
+            "Existing synthetic tables have no saved benchmark settings. "
+            "Run the full benchmark once with these settings before adding models."
+        )
+    if settings["variant"] != "best" or set(settings["prediction_arguments"]) - {
+        "--no-recovery"
+    }:
+        raise ValueError(
+            "Existing tables have no saved settings for these prediction overrides. "
+            "Run the full benchmark once or use a separate --output-dir."
+        )
+    records = []
+    with csv_path.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        has_outer = "outer_position_error" in (reader.fieldnames or [])
+        if has_outer != settings["include_outer_position_errors"]:
+            raise ValueError(
+                "Use the same --include-outer-position-errors setting as the existing tables."
+            )
+        for row in reader:
+            if row["scope"] != "input":
+                continue
+            if row.get("main_frequency_hz"):
+                raise ValueError("Cannot merge synthetic results into normal results.")
+            record = {key: row[key] for key in ("input", "system", "system_type")}
+            record.update({key: int(row.get(key) or 0) for key in COUNT_FIELDS})
+            record["duration_minutes"] = float(row["duration_minutes"])
+            records.append(normalize_record(record))
+    if (
+        not records
+        or sorted({str(Path(r["input"]).resolve()) for r in records})
+        != settings["inputs"]
+    ):
+        raise ValueError("Use the same input recordings as the existing tables.")
+    return records
+
+
+def merge_records(previous, current):
+    """Replace selected model results; keep the established baseline once."""
+    updated_models = {r["system"] for r in current if r["system_type"] == "model"}
+    input_labels = {str(Path(r["input"]).resolve()): r["input"] for r in previous}
+
+    def key(record):
+        return (
+            str(Path(record["input"]).resolve()),
+            record["system"],
+            record.get("main_frequency_hz"),
+        )
+
+    merged = {key(r): r for r in previous if r["system"] not in updated_models}
+    for record in current:
+        record = {
+            **record,
+            "input": input_labels.get(
+                str(Path(record["input"]).resolve()), record["input"]
+            ),
+        }
+        if record["system_type"] == "baseline":
+            merged.setdefault(key(record), record)
+        else:
+            merged[key(record)] = record
+    return list(merged.values())
 
 
 def _metrics_row(
@@ -687,6 +783,9 @@ def main() -> int:
     parser.add_argument("--metrics-root", required=True, type=Path)
     parser.add_argument("--overview-text", required=True, type=Path)
     parser.add_argument("--requested-input-files", required=True, type=int)
+    parser.add_argument("--run-settings", type=Path)
+    parser.add_argument("--append", action="store_true")
+    parser.add_argument("--check-existing", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--include-outer-position-errors",
         action="store_true",
@@ -696,7 +795,27 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        settings = (
+            json.loads(args.run_settings.read_text(encoding="utf-8"))
+            if args.run_settings
+            else None
+        )
+        if args.append and settings is None:
+            raise ValueError("--append requires --run-settings")
+        previous = (
+            previous_records(
+                metrics_root=args.metrics_root,
+                overview=args.overview_text,
+                settings=settings,
+            )
+            if args.append
+            else []
+        )
+        if args.check_existing:
+            return 0
         records = load_records(args.records)
+        if args.append:
+            records = merge_records(previous, records)
         text_path, csv_path, model_paths = write_prediction_overviews(
             records,
             metrics_root=args.metrics_root,
@@ -704,6 +823,11 @@ def main() -> int:
             requested_input_files=args.requested_input_files,
             include_outer_position_errors=args.include_outer_position_errors,
         )
+        if settings is not None:
+            _write_text_atomic(
+                overview_state_path(args.metrics_root, args.overview_text),
+                json.dumps(dict(settings=settings, records=records), sort_keys=True),
+            )
     except (OSError, TypeError, ValueError) as exc:
         parser.error(str(exc))
 

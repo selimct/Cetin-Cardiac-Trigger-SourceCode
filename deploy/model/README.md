@@ -18,8 +18,8 @@ Run from the repository root. Replace the example name and directory together:
 ```bash
 sudo systemctl stop dkfz-native-uart-live.service
 
-./prepare_model.sh target_r \
-    --model-dir models_noCV/target_r \
+./prepare_model.sh my_model_cv \
+    --model-dir models/my_model_cv/nested_lopo \
     --jetson-only
 
 sudo systemctl restart dkfz-native-uart-live.service
@@ -60,5 +60,5 @@ Copyright (c) 2026 Furkan Selim Cetin <mail@furkancetin.dev>
 
 This software is provided "as is", without any warranty or condition. To the
 extent permitted by law, the copyright holder will not be liable for damages
-arising from the software, its use, or its nature. See the [LICENSE](LICENSE)
+arising from the software, its use, or its nature. See the [LICENSE](../../LICENSE)
 file for the complete PolyForm Noncommercial License 1.0.0 terms.

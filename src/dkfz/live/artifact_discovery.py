@@ -12,6 +12,22 @@ RECOVERY_DIRECTORIES = ("recovery", "frozen_recovery", "lopo_recovery")
 PUBLISHED_VARIANT_DIRECTORIES = (*RECOVERY_DIRECTORIES, "delayed_100hz")
 
 
+def is_100hz_model(config, directory=None):
+    """Classify saved metadata, with declared names for older catalogues."""
+    if "frame_size_raw" in config:
+        size = int(config["frame_size_raw"])
+        if size <= 0:
+            raise ValueError("frame_size_raw must be positive")
+        return float(config.get("raw_hz", 400)) / size == 100
+    return (
+        config.get("prediction_mode") == "delayed_100hz"
+        or str(config.get("modelname", ""))
+        .removesuffix("_cv")
+        .endswith("_delayed_100hz")
+        or (directory is not None and Path(directory).name == "delayed_100hz")
+    )
+
+
 def published_model_directory(modelname, root="finished_models"):
     """Return the publication path while retaining a unique declared model name."""
     for kind in ("frozen_recovery", "lopo_recovery", "recovery", "delayed_100hz"):
@@ -40,6 +56,7 @@ def discover_models(
     names=(),
     missing_ok=False,
     exclude_recovery=False,
+    include_50hz=True,
 ):
     if method not in (None, *CV_METHODS):
         raise ValueError(f"Unknown CV method: {method}")
@@ -90,6 +107,17 @@ def discover_models(
                 )
             ):
                 continue
+            if not include_50hz and not names and not is_100hz_model(cfg, directory):
+                # Recovery has its own explicit opt-in independent of rate.
+                if not (
+                    not exclude_recovery
+                    and (
+                        cfg.get("recovery_head")
+                        or directory.name in RECOVERY_DIRECTORIES
+                        or name.endswith("_recovery")
+                    )
+                ):
+                    continue
             if not names or any(artifact.matches(value) for value in names):
                 candidates.append(artifact)
     for name in names:
@@ -169,6 +197,12 @@ def main():
         action="store_true",
         help="List only normal models, including delayed 100 Hz variants.",
     )
+    parser.add_argument("--recovery-models", action="store_true")
+    parser.add_argument(
+        "--include-50hz",
+        action="store_true",
+        help="Include 50 Hz models in automatic selection; named models are explicit selections.",
+    )
     args = parser.parse_args()
     try:
         if args.action == "resolve":
@@ -191,7 +225,9 @@ def main():
                     variant=args.variant,
                     method=args.cv_method,
                     names=args.model,
-                    exclude_recovery=args.exclude_recovery_models,
+                    exclude_recovery=args.exclude_recovery_models
+                    or not args.recovery_models,
+                    include_50hz=args.include_50hz,
                 ):
                     print(f"{candidate.name}\t{candidate.directory}")
     except (ValueError, OSError) as error:

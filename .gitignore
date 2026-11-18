@@ -24,3 +24,14 @@ AGENTS.md
 .sync_overrides.README.md
 .public-sync-stage.*/
 /build_native/
+
+# User-supplied models and generated evaluation/deployment outputs.
+/finished_models/
+/metrics/
+/dbg/
+/tmp/
+/dist/
+prepped/
+/deploy/model/model.engine
+/deploy/model/model.conf
+/.jetson-control-deployment.lock

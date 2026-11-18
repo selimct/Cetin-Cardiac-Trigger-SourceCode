@@ -13,6 +13,7 @@ MAX_FP_INCREASE=0.10
 MIN_EXTRA_FP_PER_MINUTE=0.5
 DRY_RUN=0
 LOPO=0
+ALLOW_RECOVERY=0
 ONLY_MODELS=()
 CACHE_ARGS=()
 
@@ -38,6 +39,7 @@ CPU recovery-only training caches the frozen representations in RAM by default.
 GPU and unsupported workloads use the original training path.
 
 Options:
+  --recovery-models            Required explicit opt-in to recovery training.
   --only MODEL                 Original model name; repeatable. Default: all.
   --num-epochs N               Recovery epochs (LOPO maximum). Default: 10.
   --recovery-max-fp-increase F  Relative validation FP allowance. Default: 0.10.
@@ -50,10 +52,10 @@ Options:
   --help                       Show this help.
 
 Examples:
-  ./train_finished_models_recovery.sh --dry-run
-  ./train_finished_models_recovery.sh
-  ./train_finished_models_recovery.sh --lopo --dry-run
-  ./train_finished_models_recovery.sh --only ecg3 --only slope_ecg3 --num-epochs 5
+  ./train_finished_models_recovery.sh --recovery-models --dry-run
+  ./train_finished_models_recovery.sh --recovery-models
+  ./train_finished_models_recovery.sh --recovery-models --lopo --dry-run
+  ./train_finished_models_recovery.sh --recovery-models --only ecg3 --only slope_ecg3 --num-epochs 5
 USAGE
 }
 
@@ -68,6 +70,10 @@ require_value() {
 
 while (( $# )); do
   case "$1" in
+    --recovery-models)
+      ALLOW_RECOVERY=1
+      shift
+      ;;
     --only)
       require_value "$1" "${2:-}"
       ONLY_MODELS+=("$2")
@@ -107,6 +113,8 @@ while (( $# )); do
     *) die "unknown argument: $1" ;;
   esac
 done
+
+(( ALLOW_RECOVERY )) || die "recovery training is excluded by default; pass --recovery-models"
 
 [[ -x .venv/bin/python ]] || die "project interpreter missing: .venv/bin/python"
 [[ -f run/train_finetune.py ]] || die "missing run/train_finetune.py"
@@ -186,7 +194,7 @@ for config in "${configs[@]}"; do
     work_dir="models/${output_name}_cv/nested_recovery_lopo"
     work_checkpoint="$REPO_ROOT/$work_dir/best.pth"
     source_config="$work_dir/train_config.json"
-    command=(.venv/bin/python run/train_recovery_lopo.py --output-dir "$REPO_ROOT/$work_dir" --overwrite)
+    command=(.venv/bin/python run/train_recovery_lopo.py --recovery-models --output-dir "$REPO_ROOT/$work_dir" --overwrite)
   else
     command=(.venv/bin/python run/train_finetune.py --recovery-head --recovery-only)
   fi

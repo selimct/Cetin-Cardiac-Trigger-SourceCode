@@ -7,8 +7,8 @@ set -euo pipefail
 
 # Reports automatically include recovery-head settings and calibration metadata
 # from each run's config, alongside the held-out outer-fold detection metrics.
-# All CV methods, including nested_recovery_lopo, are included by default;
-# --cv-method selects a particular workflow.
+# Default selection is non-recovery 100 Hz runs. --include-50hz and
+# --recovery-models explicitly include other families; --cv-method selects a workflow.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"

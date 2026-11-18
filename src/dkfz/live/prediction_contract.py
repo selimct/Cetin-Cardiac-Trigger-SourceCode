@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Developed at the German Cancer Research Center (DKFZ).
 
-"""Model target timing and the opt-in 100 Hz training preset.
+"""Model target timing and the default delayed 100 Hz training preset.
 
 A delayed primary uses the final recurrent state but is supervised on the
 preceding frame. Inference must preserve separate target and observation axes.
@@ -29,7 +29,9 @@ def supported_preprocessing_contract(settings: dict) -> int:
     """
     from dkfz.live.feature_framing import PREPROCESSING_CONTRACT_VERSION
 
-    value = settings.get("preprocessing_contract_version", PREPROCESSING_CONTRACT_VERSION)
+    value = settings.get(
+        "preprocessing_contract_version", PREPROCESSING_CONTRACT_VERSION
+    )
     version = int(value)
     if isinstance(value, bool) or float(value) != version:
         raise ValueError("preprocessing_contract_version must be an integer")
@@ -108,7 +110,7 @@ def apply_training_prediction_mode(kwargs: dict, config: dict, explicit: dict) -
     if mode not in PREDICTION_MODES:
         raise ValueError(f"prediction_mode must be one of {PREDICTION_MODES}")
     if mode == "delayed_100hz":
-        source_size = int(config.get("frame_size_raw", 8))
+        source_size = int(config.get("frame_size_raw", kwargs["frame_size_raw"]))
         if explicit.get("min_distance") is None:
             # Saved runtime holdoff overrides also describe physical time in
             # the source model. Do not replace an explicit 400 ms policy with
@@ -163,7 +165,38 @@ def apply_training_prediction_mode(kwargs: dict, config: dict, explicit: dict) -
             raise ValueError("delayed_100hz requires prediction_delay_frames=1")
         kwargs["prediction_delay_frames"] = 1
     else:
-        kwargs["prediction_delay_frames"] = kwargs.get("prediction_delay_frames", 0)
+        if config.get("prediction_mode") == "delayed_100hz":
+            target_size = int(explicit.get("frame_size_raw") or 8)
+            factor = int(config.get("frame_size_raw", 4)) / target_size
+            for key in (
+                "window_size",
+                "puls_norm_window_frames",
+                "min_distance",
+                "signal_quality_puls_flat_window_frames",
+                "signal_quality_puls_median_window_frames",
+            ):
+                if explicit.get(key) is None:
+                    kwargs[key] = math.ceil(kwargs[key] * factor)
+            if explicit.get("error_association_frames") is None:
+                kwargs["error_association_frames"] = int(
+                    kwargs["error_association_frames"] * factor
+                )
+            kwargs["frame_size_raw"] = target_size
+            kwargs["signal_quality_stats"] = explicit.get("signal_quality_stats")
+            if explicit.get("min_distance") is None:
+                if config.get("holdoff_frames") is not None:
+                    kwargs["min_distance"] = math.ceil(
+                        config["holdoff_frames"] * factor
+                    )
+                elif config.get("holdoff_ms") is not None:
+                    kwargs["min_distance"] = math.ceil(
+                        config["holdoff_ms"] * kwargs["raw_hz"] / (target_size * 1000)
+                    )
+            kwargs["prediction_delay_frames"] = (
+                0
+                if explicit.get("prediction_delay_frames") is None
+                else explicit["prediction_delay_frames"]
+            )
     prediction_delay(kwargs)
     return kwargs
 

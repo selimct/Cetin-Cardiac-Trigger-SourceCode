@@ -52,7 +52,7 @@ TRT_RUNTIME_DEFAULTS = {
     "out_log": None,
     "include_input_name_in_outputs": True,
     "threshold": None,
-    "modelname": "target_r",
+    "modelname": "ecg3_delayed_100hz",
     "model_variant": "best",
     "model_dir": None,
     "holdoff_frames": None,

@@ -17,8 +17,10 @@ DRY_RUN=0
 OVERWRITE=0
 RUN_COUNT=0
 ONLY_MODELS=()
-RECOVERY_HEAD=1
-MODEL_KIND="recovery"
+RECOVERY_HEAD=0
+MODEL_KIND="delayed_100hz"
+NOPULS_SUFFIX=""
+EXPLICIT_MODE=0
 RECOVERY_MAX_FP_INCREASE="0.10"
 RECOVERY_ALLOWANCE_SET=0
 MAX_PARALLEL=1
@@ -38,18 +40,20 @@ usage() {
   cat <<'USAGE'
 Usage: ./train_models_lopo.sh [options]
        ./train_models_lopo.sh delayed-100hz [options]
+       ./train_models_lopo.sh normal [options]
+       ./train_models_lopo.sh recovery [options]
        ./train_models_lopo.sh recovery-only [recovery LOPO options]
        ./train_models_lopo.sh reselect-thresholds [reselection options]
 
-Train fresh two-output nested LOPO models for ecg3, slope_ecg3,
+Train fresh delayed 100 Hz nested LOPO models for ecg3, slope_ecg3,
 slope_slow_ecg3, slope_ecg3_cqm4ecg and slope_slow_ecg3_cqm4ecg.
 Read architecture and preprocessing settings from config/lopo_recipes/MODEL.json,
-with new random weights for the LSTM and both heads.
-Publish under finished_models/MODEL/recovery/.
-The delayed-100hz subcommand instead trains one previous-frame primary at
-100 Hz and publishes finished_models/MODEL/delayed_100hz/ with model name
-MODEL_delayed_100hz. It preserves inherited physical window/history durations,
-uses fresh weights, and disables the recovery head.
+with new random weights and one previous-frame primary output.
+Publish under finished_models/MODEL/delayed_100hz/ as MODEL_delayed_100hz.
+The delayed-100hz subcommand explicitly selects this default. The normal
+subcommand opts into 50 Hz current-frame training and publishes MODEL/.
+Recovery training requires the recovery subcommand or --recovery-head.
+All modes preserve physical window/history durations and use fresh weights.
 The command in build_training_command sets LR to 0.001 for every model,
 overriding the recipe's learning rate.
 No source checkpoint is loaded and no HPO search is performed.
@@ -62,9 +66,12 @@ Options:
   --recipe-dir DIR    Training recipe directory. Default: config/lopo_recipes.
                       Recipes are independent of models/ and finished_models/.
   --only MODEL        Run only this model. May be repeated.
-  --recovery-head     Accepted for compatibility in the default recovery mode.
-                      Incompatible with delayed-100hz. --only accepts the recipe
-                      name or MODEL_recovery / MODEL_delayed_100hz for its mode.
+  --nopuls            Disable pulse input. Add _nopuls before the mode suffix
+                      and publish under finished_models/MODEL_nopuls/.
+  --recovery-head     Explicitly select joint 50 Hz recovery training.
+  --recovery-models   Alias for --recovery-head. Recovery is excluded by default.
+                      Incompatible with explicit delayed-100hz. --only accepts
+                      the recipe name or the selected mode's declared model name.
   --recovery-max-fp-increase FRACTION
                       Validation FP allowance for recovery. Default: 0.10 (10%).
                       Primary threshold stays fixed during recovery calibration.
@@ -89,6 +96,7 @@ reported and skipped. Incomplete/unverifiable runs are replaced as well.
 Examples:
   ./train_models_lopo.sh --dry-run
   ./train_models_lopo.sh --only ecg3
+  ./train_models_lopo.sh delayed-100hz --only ecg3 --nopuls
   ./train_models_lopo.sh --parallel 4 --start-delay-minutes 20 --dry-run
   ./train_models_lopo.sh --parallel 2 --start-delay-minutes 20
   ./train_models_lopo.sh --only slope_slow_ecg3
@@ -175,7 +183,10 @@ print(
 publish_best_model() {
   local modelname="$1"
   local output_dir="$2"
-  local finished_dir="${FINISHED_MODELS_ROOT}/${modelname%_${MODEL_KIND}}/${MODEL_KIND}"
+  local finished_dir="${FINISHED_MODELS_ROOT}/${modelname}"
+  if [[ -n "$MODEL_KIND" ]]; then
+    finished_dir="${FINISHED_MODELS_ROOT}/${modelname%_${MODEL_KIND}}/${MODEL_KIND}"
+  fi
 
   "$LOPO_PYTHON" - "$modelname" "$output_dir" "$finished_dir" "${3:-always}" <<'PY'
 from __future__ import annotations
@@ -305,7 +316,7 @@ should_run() {
 }
 
 build_training_command() {
-  local modelname="${1}_${MODEL_KIND}"
+  local modelname="${1}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   local source_config="$2"
   local epoch_limit="$3"
   local output_dir="models/${modelname}_cv/nested_lopo"
@@ -324,9 +335,14 @@ build_training_command() {
     --set manual_threshold=null
   )
   if (( RECOVERY_HEAD )); then
-    TRAINING_COMMAND+=(--recovery-head --recovery-max-fp-increase "$RECOVERY_MAX_FP_INCREASE")
+    TRAINING_COMMAND+=(--prediction-mode current --recovery-head --recovery-max-fp-increase "$RECOVERY_MAX_FP_INCREASE")
   elif [[ "$MODEL_KIND" == delayed_100hz ]]; then
     TRAINING_COMMAND+=(--prediction-mode delayed_100hz --no-recovery-head)
+  else
+    TRAINING_COMMAND+=(--prediction-mode current --no-recovery-head)
+  fi
+  if [[ -n "$NOPULS_SUFFIX" ]]; then
+    TRAINING_COMMAND+=(--set not_use_puls=true)
   fi
   if (( OVERWRITE )); then
     TRAINING_COMMAND+=(--overwrite)
@@ -334,7 +350,7 @@ build_training_command() {
 }
 
 run_one() {
-  local modelname="${1}_${MODEL_KIND}"
+  local modelname="${1}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   local family_dir="models/${modelname}_cv"
   local output_dir="${family_dir}/nested_lopo"
   local log="${family_dir}/nested_lopo.log"
@@ -345,8 +361,8 @@ run_one() {
   printf 'Command:'
   printf ' %q' "${command[@]}"
   printf '\n'
-  printf 'Publish target: %s/%s/%s/{best.pth,train_config.json}\n' \
-    "$FINISHED_MODELS_ROOT" "$1" "$MODEL_KIND"
+  printf 'Publish target: %s/%s%s/{best.pth,train_config.json}\n' \
+    "$FINISHED_MODELS_ROOT" "${1}${NOPULS_SUFFIX}" "${MODEL_KIND:+/$MODEL_KIND}"
 
   if (( DRY_RUN )); then
     return
@@ -371,7 +387,7 @@ run_one() {
 }
 
 publish_skipped_model() {
-  local modelname="${1}_${MODEL_KIND}"
+  local modelname="${1}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   local family_dir="models/${modelname}_cv"
   local model_lock
   exec {model_lock}>"$family_dir/.nested_lopo.lock"
@@ -381,19 +397,21 @@ publish_skipped_model() {
 }
 
 prepare_runs() {
-  local recipe requested matched config epoch_limit output_dir decision action reason
+  local recipe requested matched config epoch_limit modelname output_dir decision action reason
   # Validate every selection before starting any training or writing summaries.
   for requested in "${ONLY_MODELS[@]}"; do
     matched=0
     for recipe in "${RECIPES[@]}"; do
-      if [[ "$requested" == "$recipe" || "$requested" == "${recipe}_${MODEL_KIND}" ]]; then
+      modelname="${recipe}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+      if [[ "$requested" == "$recipe" || "$requested" == "${recipe}${NOPULS_SUFFIX}" || "$requested" == "$modelname" ]]; then
         matched=1
       fi
     done
     (( matched )) || die "unknown --only model: $requested"
   done
   for recipe in "${RECIPES[@]}"; do
-    if ! should_run "$recipe" && ! should_run "${recipe}_${MODEL_KIND}"; then
+    modelname="${recipe}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+    if ! should_run "$recipe" && ! should_run "${recipe}${NOPULS_SUFFIX}" && ! should_run "$modelname"; then
       continue
     fi
     config="$RECIPE_DIR/$recipe.json"
@@ -410,7 +428,7 @@ if isinstance(value, bool) or int(value) != float(value) or int(value) < 1:
 print(int(value))
 PY
 )"
-    output_dir="models/${recipe}_${MODEL_KIND}_cv/nested_lopo"
+    output_dir="models/${modelname}_cv/nested_lopo"
     build_training_command "$recipe" "$config" "$epoch_limit"
     decision="$(PYTHONDONTWRITEBYTECODE=1 "${TRAINING_COMMAND[@]}" --check-existing)"
     read -r action reason <<< "$("$LOPO_PYTHON" -c '
@@ -419,7 +437,7 @@ decision = json.loads(sys.argv[1])
 print(decision["action"], decision["reason"])
 ' "$decision")"
     if [[ "$action" == reuse ]]; then
-      printf 'Skipping %s_%s: %s; use --overwrite to retrain.\n' "$recipe" "$MODEL_KIND" "$reason"
+      printf 'Skipping %s: %s; use --overwrite to retrain.\n' "$modelname" "$reason"
       SKIPPED_MODELS+=("$recipe")
       continue
     fi
@@ -485,7 +503,7 @@ run_selected_models() {
       run_one "${SELECTED_MODELS[index]}" "${SOURCE_CONFIGS[index]}" "${EPOCH_LIMITS[index]}" &
       pid=$!
       ACTIVE_PIDS+=("$pid")
-      JOB_MODELS[$pid]="${SELECTED_MODELS[index]}_${MODEL_KIND}"
+      JOB_MODELS[$pid]="${SELECTED_MODELS[index]}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
       printf 'Started %s (PID %d)\n' "${JOB_MODELS[$pid]}" "$pid"
       next_start=$((SECONDS + delay_seconds))
       index=$((index + 1))
@@ -502,13 +520,19 @@ run_selected_models() {
 main() {
 if [[ "${1:-}" == delayed-100hz ]]; then
   shift
-  MODEL_KIND="delayed_100hz"
-  RECOVERY_HEAD=0
-  METRICS_SUMMARY="models/lopo_delayed_100hz_metrics_overview.txt"
+  EXPLICIT_MODE=1
+elif [[ "${1:-}" == normal || "${1:-}" == 50hz ]]; then
+  shift
+  MODEL_KIND=""
+  EXPLICIT_MODE=1
+elif [[ "${1:-}" == recovery ]]; then
+  shift
+  MODEL_KIND="recovery"
+  RECOVERY_HEAD=1
 fi
 if [[ "${1:-}" == "recovery-only" || "${1:-}" == "recovery-lopo" ]]; then
   shift
-  exec bash train_finished_models_recovery.sh --lopo "$@"
+  exec bash train_finished_models_recovery.sh --recovery-models --lopo "$@"
 fi
 if [[ "${1:-}" == "reselect-thresholds" ]]; then
   shift
@@ -532,9 +556,14 @@ while (( $# > 0 )); do
       ONLY_MODELS+=("$2")
       shift 2
       ;;
-    --recovery-head)
-      [[ "$MODEL_KIND" != delayed_100hz ]] || die "delayed-100hz uses one primary output; --recovery-head is incompatible"
+    --nopuls)
+      NOPULS_SUFFIX="_nopuls"
+      shift
+      ;;
+    --recovery-head|--recovery-models)
+      [[ "$EXPLICIT_MODE" -eq 0 || "$MODEL_KIND" != delayed_100hz ]] || die "delayed-100hz uses one primary output; --recovery-head is incompatible"
       RECOVERY_HEAD=1
+      MODEL_KIND="recovery"
       shift
       ;;
     --recovery-max-fp-increase)
@@ -603,6 +632,12 @@ elif (( RECOVERY_ALLOWANCE_SET )); then
 fi
 
 [[ -d "$PATIENT_ROOT" ]] || die "patient root is not a directory: $PATIENT_ROOT"
+if [[ "$MODEL_KIND" == delayed_100hz ]]; then
+  METRICS_SUMMARY="models/lopo_delayed_100hz_metrics_overview.txt"
+fi
+if [[ -n "$NOPULS_SUFFIX" ]]; then
+  METRICS_SUMMARY="models/lopo_nopuls${MODEL_KIND:+_${MODEL_KIND}}_metrics_overview.txt"
+fi
 
 prepare_runs
 if (( ! DRY_RUN )); then
@@ -617,7 +652,7 @@ fi
 if (( ! DRY_RUN )); then
   init_metrics_summary
   for skipped_model in "${SKIPPED_MODELS[@]}"; do
-    append_metrics_overview "${skipped_model}_${MODEL_KIND}"
+    append_metrics_overview "${skipped_model}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   done
 fi
 run_selected_models

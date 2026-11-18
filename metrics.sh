@@ -12,37 +12,46 @@ usage() {
   cat <<'USAGE'
 Usage: ./metrics.sh [normal|synthetic] [options]
 
-Evaluate all published normal and recovery models in finished_models/ on the
-six preferred recordings: p02 head, p14 heart/head, p16 head/heart/pelvis.
+Evaluate published non-recovery 100 Hz models in finished_models/ on the six preferred
+recordings: p02 head, p14 heart/head, p16 head/heart/pelvis.
 Both modes use --only-missing and generate pooled and per-input reports.
 Relative paths in additional options are resolved from the project root.
 
 Modes:
   normal                    Original recordings; default when no mode is given.
                             Reports: metrics/
-  synthetic                 Full gradient-frequency sweep.
+  synthetic                 Full gradient-frequency sweep at 0.6 noise amplitude.
                             Reports: metrics/synthetic/
 
 Options:
-  --exclude-recovery-models Run only normal 50 Hz and delayed 100 Hz models;
-                            skip all recovery model versions.
-  --save-prepped            Keep full prediction/event parquets under metrics/prepped/
+  --jobs N                   Evaluate up to N recordings concurrently (default 1).
+                            CUDA workers share the selected GPU.
+  --add-model MODEL          Add this model to existing comparison tables without
+                            evaluating the other models. Repeatable.
+  --recovery-models         Include recovery, frozen recovery, and LOPO recovery
+                            model versions. Default: exclude recovery models.
+  --include-50hz      Also include 50 Hz models. Naming one with --model
+                            explicitly selects it as well.
+  --save-prepped            Keep full prediction/event parquets (default) under metrics/prepped/
                             with the same normal/synthetic/model subdirectories.
-                            Default: keep only small report caches; reuse saved
-                            parquets and matching predictions on subsequent runs.
+                            Git ignores these directories. Matching files are reused.
+  --no-save-prepped         Keep only compact caches and reports; full prediction
+                            and event parquets are temporary for this run.
   --dry-run                 Print the command without running inference or plots.
   --help, -h                Show this help.
   Remaining options         Passed to create_prediction_metrics.sh, for example
                             --model ecg3_recovery or --output-dir metrics/custom.
                             Use -- before offline_predict.py overrides.
+                            Full noise: -- --synthetic-noise-multiplier 1
 
 Examples:
   ./metrics.sh normal
-  ./metrics.sh normal --exclude-recovery-models
+  ./metrics.sh normal --recovery-models
   ./metrics.sh synthetic
-  ./metrics.sh normal --save-prepped
-  ./metrics.sh synthetic --save-prepped
-  ./metrics.sh normal --model ecg3 --model ecg3_recovery
+  ./metrics.sh normal --no-save-prepped
+  ./metrics.sh normal --recovery-models --model ecg3 --model ecg3_recovery
+  ./metrics.sh normal --jobs 2
+  ./metrics.sh normal --add-model slope_ecg3_delayed_100hz --jobs 2
 USAGE
 }
 
@@ -54,7 +63,7 @@ case "${1:-}" in
 esac
 
 DRY_RUN=0
-SAVE_PREPPED=0
+SAVE_PREPPED=1
 FORWARDED_ARGS=()
 while (( $# )); do
   case "$1" in
@@ -70,6 +79,8 @@ done
 COMMAND=("$REPO_ROOT/create_prediction_metrics.sh" finished_models --only-missing)
 if [[ "$SAVE_PREPPED" -eq 1 ]]; then
   COMMAND+=(--save-prepped)
+else
+  COMMAND+=(--no-save-prepped)
 fi
 if [[ "$MODE" == "synthetic" ]]; then
   COMMAND+=(--synthetic-gradient)
