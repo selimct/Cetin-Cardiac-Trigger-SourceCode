@@ -113,8 +113,8 @@ def apply_training_prediction_mode(kwargs: dict, config: dict, explicit: dict) -
         source_size = int(config.get("frame_size_raw", kwargs["frame_size_raw"]))
         if explicit.get("min_distance") is None:
             # Saved runtime holdoff overrides also describe physical time in
-            # the source model. Do not replace an explicit 400 ms policy with
-            # the preset's 200 ms default when starting a fresh model.
+            # the source model. Preserve that duration when starting a fresh
+            # model at a different frame rate.
             if config.get("holdoff_frames") is not None:
                 kwargs["min_distance"] = int(config["holdoff_frames"])
         if config.get("prediction_mode") != "delayed_100hz":

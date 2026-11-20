@@ -15,6 +15,8 @@ CV_METHOD=""
 MODELS_ROOT=""
 METRICS_ROOT="metrics"
 OVERVIEW=""
+WORD_TABLES=0
+WORD_OUTPUT=""
 ONLY_MISSING=0
 JOBS=1
 APPEND=0
@@ -88,6 +90,11 @@ Options:
   --output FILE              Overview table path. Default:
                              <output-dir>/prediction_metrics_overview.txt
                              A companion .csv is always written.
+  --word-tables             Update Tables_metrics.docx under the artifact root.
+                             Normal/synthetic runs update separate tables in the
+                             same document. Three paper models, 100 Hz only;
+                             the Word synthetic table omits 90 Hz.
+  --word-output FILE        Set the Word document path; implies --word-tables.
   --model MODEL              Only run one model. Repeatable. Naming a 50 Hz
                              model explicitly opts into that model.
                              Default: non-recovery 100 Hz models with artifacts.
@@ -198,6 +205,16 @@ while [[ $# -gt 0 ]]; do
     --output-dir)
       [[ $# -ge 2 ]] || die "--output-dir requires a directory"
       METRICS_ROOT="$2"
+      shift 2
+      ;;
+    --word-tables)
+      WORD_TABLES=1
+      shift
+      ;;
+    --word-output)
+      [[ $# -ge 2 ]] || die "--word-output requires a path"
+      WORD_OUTPUT="$2"
+      WORD_TABLES=1
       shift 2
       ;;
     --model)
@@ -335,6 +352,9 @@ CACHE_ROOT="$ARTIFACT_ROOT/.cache"
 if [[ "$DISABLE_RECOVERY" -eq 1 ]]; then
   METRICS_ROOT="$METRICS_ROOT/current_only"
   PREDICT_ARGS+=(--no-recovery)
+fi
+if [[ -z "$WORD_OUTPUT" ]]; then
+  WORD_OUTPUT="$METRICS_ROOT/Tables_metrics.docx"
 fi
 if [[ "$SAVE_SYNTHETIC" -eq 1 && "$SYNTHETIC_GRADIENT" -eq 0 ]]; then
   die "--save-synthetic requires --synthetic-gradient"
@@ -496,13 +516,12 @@ from dkfz.live.prediction_cache import read_prediction_frame
 
 prediction_log = Path(sys.argv[1])
 target_col = "target"
-error_association_frames = 1
 
 df = read_prediction_frame(prediction_log)
+# Infer the same TP/PE/oPE radii used for the model at this frame rate.
 report = build_siemens_trigger_metrics_report(
     df,
     target_col=target_col,
-    error_association_frames=error_association_frames,
 )
 event = report["event_position"]
 false_positive = int(event["unmatched_false_positive"])
@@ -979,6 +998,18 @@ if ! "$PYTHON_BIN" "$OVERVIEW_SCRIPT" \
     --requested-input-files "${#RESOLVED_INPUTS[@]}"; then
   echo "Could not create pooled prediction metrics overviews" >&2
   exit_status=1
+elif [[ "$WORD_TABLES" -eq 1 ]]; then
+  word_mode="normal"
+  [[ "$SYNTHETIC_GRADIENT" -eq 0 ]] || word_mode="synthetic"
+  word_args=(--models-root "$MODELS_ROOT" --output "$WORD_OUTPUT"
+    "--${word_mode}-csv" "${OVERVIEW%.*}.csv")
+  for model in "${MODELS[@]}"; do
+    word_args+=(--model-config "$model=${MODEL_DIRS[$model]}/$CONFIG_REL")
+  done
+  if ! "$PYTHON_BIN" run/create_metrics_word_tables.py "${word_args[@]}"; then
+    echo "Could not create Word metrics tables" >&2
+    exit_status=1
+  fi
 fi
 
 exit "$exit_status"

@@ -101,7 +101,7 @@ PREDICTION_RUNTIME_DEFAULTS = {
     "model_variant": "best",
     "model_dir": None,
     "holdoff_frames": None,
-    "holdoff_ms": 200.0,
+    "holdoff_ms": 400.0,
     "error_association_frames": 1,
     "ecg1_col": "ecg1_raw",
     "ecg2_col": "ecg2_raw",

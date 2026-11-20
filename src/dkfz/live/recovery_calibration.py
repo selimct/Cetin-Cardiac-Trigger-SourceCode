@@ -218,7 +218,7 @@ def calibrate_config(
                     "Validation predictions do not match the selected deployment epoch"
                 )
         frames.append(frame)
-    holdoff = int(cfg.get("holdoff_frames", cfg.get("min_distance", 10)))
+    holdoff = int(cfg.get("holdoff_frames", cfg.get("min_distance", 20)))
     from dkfz.live.event_matching import event_tolerances
 
     policy = event_tolerances(cfg)

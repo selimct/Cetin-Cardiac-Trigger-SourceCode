@@ -41,7 +41,7 @@
   "puls_clip": true,
   "align_to_puls_blocks": true,
   "verify_puls_constant_within_block": false,
-  "min_distance": 20,
+  "min_distance": 40,
   "error_association_frames": 3,
   "threshold_objective": "min_error",
   "threshold_sensitivity_efficiency": 0.95,

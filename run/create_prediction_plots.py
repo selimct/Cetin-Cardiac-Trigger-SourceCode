@@ -118,7 +118,7 @@ def prediction_analysis_settings(config: dict, metrics: dict) -> dict:
         ),
         "threshold": float(threshold),
         "holdoff_frames": int(
-            config.get("holdoff_frames", config.get("min_distance", 10))
+            config.get("holdoff_frames", config.get("min_distance", 20))
         ),
         **policy,
         "sensitivity_efficiency": float(

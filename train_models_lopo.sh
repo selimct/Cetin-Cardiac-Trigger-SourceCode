@@ -20,12 +20,14 @@ ONLY_MODELS=()
 RECOVERY_HEAD=0
 MODEL_KIND="delayed_100hz"
 NOPULS_SUFFIX=""
+WINDOW_SUFFIX=""
 EXPLICIT_MODE=0
 RECOVERY_MAX_FP_INCREASE="0.10"
 RECOVERY_ALLOWANCE_SET=0
 MAX_PARALLEL=1
 START_DELAY_MINUTES=20
 MAX_EPOCHS=""
+WINDOW_SIZE=""
 BASE_SEED=42
 RECIPES=(ecg3 slope_ecg3 slope_slow_ecg3 slope_ecg3_cqm4ecg slope_slow_ecg3_cqm4ecg)
 SELECTED_MODELS=()
@@ -66,6 +68,9 @@ Options:
   --recipe-dir DIR    Training recipe directory. Default: config/lopo_recipes.
                       Recipes are independent of models/ and finished_models/.
   --only MODEL        Run only this model. May be repeated.
+                      ecg12 selects ECG1 and ECG2 without ECG3. It is excluded
+                      from the default five-family run; add --nopuls to use
+                      only those two ECG inputs.
   --nopuls            Disable pulse input. Add _nopuls before the mode suffix
                       and publish under finished_models/MODEL_nopuls/.
   --recovery-head     Explicitly select joint 50 Hz recovery training.
@@ -82,6 +87,10 @@ Options:
   --num-epochs N      Override the maximum epoch search budget. Otherwise use
                       configured_max_epochs from each recipe, falling
                       back to its num_epochs, then 35.
+  --window-size N     Override the sliding window in model frames.
+                      At 100 Hz, 600 frames span six seconds.
+                      Add _wsN after _nopuls (when used) and before the mode
+                      suffix in model names, output paths and summaries.
   --seed N            Base training seed. Default: 42.
   --overwrite         Force retraining even when an identical completed run exists.
   --dry-run           Print commands without training or writing summaries.
@@ -97,6 +106,8 @@ Examples:
   ./train_models_lopo.sh --dry-run
   ./train_models_lopo.sh --only ecg3
   ./train_models_lopo.sh delayed-100hz --only ecg3 --nopuls
+  ./train_models_lopo.sh delayed-100hz --only ecg12 --nopuls
+  ./train_models_lopo.sh delayed-100hz --only ecg3 --window-size 600
   ./train_models_lopo.sh --parallel 4 --start-delay-minutes 20 --dry-run
   ./train_models_lopo.sh --parallel 2 --start-delay-minutes 20
   ./train_models_lopo.sh --only slope_slow_ecg3
@@ -316,7 +327,7 @@ should_run() {
 }
 
 build_training_command() {
-  local modelname="${1}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+  local modelname="${1}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   local source_config="$2"
   local epoch_limit="$3"
   local output_dir="models/${modelname}_cv/nested_lopo"
@@ -344,13 +355,19 @@ build_training_command() {
   if [[ -n "$NOPULS_SUFFIX" ]]; then
     TRAINING_COMMAND+=(--set not_use_puls=true)
   fi
+  if [[ "$1" == ecg12 ]]; then
+    TRAINING_COMMAND+=(--set ecg3_col=null)
+  fi
+  if [[ -n "$WINDOW_SIZE" ]]; then
+    TRAINING_COMMAND+=(--window-size "$WINDOW_SIZE")
+  fi
   if (( OVERWRITE )); then
     TRAINING_COMMAND+=(--overwrite)
   fi
 }
 
 run_one() {
-  local modelname="${1}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+  local modelname="${1}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   local family_dir="models/${modelname}_cv"
   local output_dir="${family_dir}/nested_lopo"
   local log="${family_dir}/nested_lopo.log"
@@ -362,7 +379,7 @@ run_one() {
   printf ' %q' "${command[@]}"
   printf '\n'
   printf 'Publish target: %s/%s%s/{best.pth,train_config.json}\n' \
-    "$FINISHED_MODELS_ROOT" "${1}${NOPULS_SUFFIX}" "${MODEL_KIND:+/$MODEL_KIND}"
+    "$FINISHED_MODELS_ROOT" "${1}${NOPULS_SUFFIX}${WINDOW_SUFFIX}" "${MODEL_KIND:+/$MODEL_KIND}"
 
   if (( DRY_RUN )); then
     return
@@ -387,7 +404,7 @@ run_one() {
 }
 
 publish_skipped_model() {
-  local modelname="${1}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+  local modelname="${1}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   local family_dir="models/${modelname}_cv"
   local model_lock
   exec {model_lock}>"$family_dir/.nested_lopo.lock"
@@ -398,20 +415,28 @@ publish_skipped_model() {
 
 prepare_runs() {
   local recipe requested matched config epoch_limit modelname output_dir decision action reason
+  # ECG1/2 is an explicit opt-in; keep the default five-family run unchanged.
+  if (( ${#ONLY_MODELS[@]} > 0 )) && {
+    should_run ecg12 ||
+    should_run "ecg12${NOPULS_SUFFIX}${WINDOW_SUFFIX}" ||
+    should_run "ecg12${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+  }; then
+    RECIPES+=(ecg12)
+  fi
   # Validate every selection before starting any training or writing summaries.
   for requested in "${ONLY_MODELS[@]}"; do
     matched=0
     for recipe in "${RECIPES[@]}"; do
-      modelname="${recipe}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
-      if [[ "$requested" == "$recipe" || "$requested" == "${recipe}${NOPULS_SUFFIX}" || "$requested" == "$modelname" ]]; then
+      modelname="${recipe}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+      if [[ "$requested" == "$recipe" || "$requested" == "${recipe}${NOPULS_SUFFIX}${WINDOW_SUFFIX}" || "$requested" == "$modelname" ]]; then
         matched=1
       fi
     done
     (( matched )) || die "unknown --only model: $requested"
   done
   for recipe in "${RECIPES[@]}"; do
-    modelname="${recipe}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
-    if ! should_run "$recipe" && ! should_run "${recipe}${NOPULS_SUFFIX}" && ! should_run "$modelname"; then
+    modelname="${recipe}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+    if ! should_run "$recipe" && ! should_run "${recipe}${NOPULS_SUFFIX}${WINDOW_SUFFIX}" && ! should_run "$modelname"; then
       continue
     fi
     config="$RECIPE_DIR/$recipe.json"
@@ -503,7 +528,7 @@ run_selected_models() {
       run_one "${SELECTED_MODELS[index]}" "${SOURCE_CONFIGS[index]}" "${EPOCH_LIMITS[index]}" &
       pid=$!
       ACTIVE_PIDS+=("$pid")
-      JOB_MODELS[$pid]="${SELECTED_MODELS[index]}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+      JOB_MODELS[$pid]="${SELECTED_MODELS[index]}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
       printf 'Started %s (PID %d)\n' "${JOB_MODELS[$pid]}" "$pid"
       next_start=$((SECONDS + delay_seconds))
       index=$((index + 1))
@@ -587,6 +612,11 @@ while (( $# > 0 )); do
       MAX_EPOCHS="$2"
       shift 2
       ;;
+    --window-size)
+      (( $# >= 2 )) || die "--window-size requires a frame count"
+      WINDOW_SIZE="$2"
+      shift 2
+      ;;
     --seed)
       (( $# >= 2 )) || die "--seed requires an integer"
       BASE_SEED="$2"
@@ -614,6 +644,7 @@ done
 [[ "$START_DELAY_MINUTES" =~ ^(0|[1-9][0-9]*)$ ]] || die "--start-delay-minutes must be a nonnegative integer"
 [[ "$BASE_SEED" =~ ^(0|[1-9][0-9]*)$ ]] || die "--seed must be a nonnegative integer"
 [[ -z "$MAX_EPOCHS" || "$MAX_EPOCHS" =~ ^[1-9][0-9]*$ ]] || die "--num-epochs must be a positive integer"
+[[ -z "$WINDOW_SIZE" || "$WINDOW_SIZE" =~ ^[1-9][0-9]*$ ]] || die "--window-size must be a positive integer"
 
 if (( RECOVERY_HEAD )); then
   "$LOPO_PYTHON" - "$RECOVERY_MAX_FP_INCREASE" <<'PY'
@@ -631,12 +662,13 @@ elif (( RECOVERY_ALLOWANCE_SET )); then
   die "--recovery-max-fp-increase requires --recovery-head"
 fi
 
-[[ -d "$PATIENT_ROOT" ]] || die "patient root is not a directory: $PATIENT_ROOT"
-if [[ "$MODEL_KIND" == delayed_100hz ]]; then
-  METRICS_SUMMARY="models/lopo_delayed_100hz_metrics_overview.txt"
+if [[ -n "$WINDOW_SIZE" ]]; then
+  WINDOW_SUFFIX="_ws${WINDOW_SIZE}"
 fi
-if [[ -n "$NOPULS_SUFFIX" ]]; then
-  METRICS_SUMMARY="models/lopo_nopuls${MODEL_KIND:+_${MODEL_KIND}}_metrics_overview.txt"
+
+[[ -d "$PATIENT_ROOT" ]] || die "patient root is not a directory: $PATIENT_ROOT"
+if [[ -n "$NOPULS_SUFFIX$WINDOW_SUFFIX$MODEL_KIND" ]]; then
+  METRICS_SUMMARY="models/lopo${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}_metrics_overview.txt"
 fi
 
 prepare_runs
@@ -652,7 +684,7 @@ fi
 if (( ! DRY_RUN )); then
   init_metrics_summary
   for skipped_model in "${SKIPPED_MODELS[@]}"; do
-    append_metrics_overview "${skipped_model}${NOPULS_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
+    append_metrics_overview "${skipped_model}${NOPULS_SUFFIX}${WINDOW_SUFFIX}${MODEL_KIND:+_${MODEL_KIND}}"
   done
 fi
 run_selected_models

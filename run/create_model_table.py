@@ -197,7 +197,9 @@ def gradient_update_counts(
     return windows, per_epoch, per_epoch * epochs
 
 
-def build_rows(config: Path) -> tuple[str, list[Row]]:
+def build_rows(
+    config: Path, *, include_gradient_updates: bool = True
+) -> tuple[str, list[Row]]:
     """Build a compact methods table, grouping related settings."""
     raw = json.loads(config.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -301,7 +303,11 @@ def build_rows(config: Path) -> tuple[str, list[Row]]:
     if raw.get("configured_max_epochs"):
         epochs += f" selected (maximum {raw['configured_max_epochs']})"
     add("Training epochs", epochs, "num_epochs")
-    updates = gradient_update_counts(config, raw, values)
+    updates = (
+        gradient_update_counts(config, raw, values)
+        if include_gradient_updates
+        else None
+    )
     if updates is not None:
         _, per_epoch, total = updates
         add(

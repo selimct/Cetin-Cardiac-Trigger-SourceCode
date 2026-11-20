@@ -82,7 +82,7 @@ def _holdoff_frames(cfg: dict[str, Any]) -> int:
     else:
         raw_hz = float(_require(cfg, "raw_hz"))
         frame_size = int(_require(cfg, "frame_size_raw"))
-        holdoff_ms = float(cfg.get("holdoff_ms", 200.0))
+        holdoff_ms = float(cfg.get("holdoff_ms", 400.0))
         value = int(math.ceil(holdoff_ms * (raw_hz / frame_size) / 1000.0))
     if value < 0:
         raise ValueError("holdoff_frames may not be negative.")

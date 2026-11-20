@@ -452,7 +452,7 @@ def reselect_variant(
             "Two-output models require joint recovery calibration; use run/calibrate_recovery.py"
         )
     target_col = str(config.get("target_col", "target"))
-    holdoff_frames = int(config.get("holdoff_frames", config.get("min_distance", 10)))
+    holdoff_frames = int(config.get("holdoff_frames", config.get("min_distance", 20)))
     policy = event_tolerances(config)
     error_association_frames = policy["error_association_frames"]
     previous_threshold = float(config["threshold"])

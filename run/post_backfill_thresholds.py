@@ -181,13 +181,13 @@ def validation_rows(frames, cfg, thresholds):
     probabilities, targets = pack_validation_sequences(
         pd.concat(prepared, ignore_index=True),
         target_col=cfg.get("target_col", "target"),
-        holdoff_frames=int(cfg.get("holdoff_frames", cfg.get("min_distance", 10))),
+        holdoff_frames=int(cfg.get("holdoff_frames", cfg.get("min_distance", 20))),
         error_association_frames=event_tolerances(cfg)["error_association_frames"],
     )
     return evaluate_threshold_grid(
         probabilities,
         np.flatnonzero(targets == 1),
-        holdoff_frames=int(cfg.get("holdoff_frames", cfg.get("min_distance", 10))),
+        holdoff_frames=int(cfg.get("holdoff_frames", cfg.get("min_distance", 20))),
         **event_tolerances(cfg),
         thresholds=thresholds,
     )

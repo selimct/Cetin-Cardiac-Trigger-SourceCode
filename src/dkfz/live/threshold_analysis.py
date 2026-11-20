@@ -39,7 +39,7 @@ def fixed_threshold_analysis(
     *,
     threshold: float,
     sensitivity_efficiency: float = 0.95,
-    holdoff_frames: int = 10,
+    holdoff_frames: int = 20,
     error_association_frames: int = 1,
     thresholds=None,
     additional_sequences=(),

@@ -258,7 +258,7 @@ def eval_torch(
     model,
     val_loader,
     error_association_frames=1,
-    holdoff_frames=10,
+    holdoff_frames=20,
     threshold_objective="min_error",
     threshold_sensitivity_efficiency=0.95,
     device=None,
@@ -278,7 +278,7 @@ def eval_torch(
         error_association_frames (int, optional): Maximum frame distance used
             only to attribute a non-exact prediction as one position error.
             TP tolerance is zero at 50 Hz and one frame at 100 Hz. Defaults to 1 for the 50 Hz PE radius.
-        holdoff_frames (int, optional): Number of minimum frames between r peak predictions. Defaults to 10 (200 ms at 50 Hz).
+        holdoff_frames (int, optional): Number of minimum frames between r peak predictions. Defaults to 20 (400 ms at 50 Hz).
         threshold_objective (str, optional): Use ``min_error`` or conservative
             ``min_fp`` selection. Defaults to ``min_error``.
         threshold_sensitivity_efficiency (float, optional): Fraction of the
@@ -503,7 +503,7 @@ def predict_torch(
     window_size=25,
     device=None,
     use_amp=True,
-    holdoff_frames: int | None = 10,
+    holdoff_frames: int | None = 20,
     recovery_threshold: float | None = None,
 ):
     """Return frame-aligned probabilities and live-trigger predictions.
@@ -515,7 +515,7 @@ def predict_torch(
         window_size (int, optional): Window size. Defaults to 25.
         device (str | torch.device | None, optional): CUDA or CPU. Defaults to None.
         use_amp (bool, optional): Automatic mixed precision for CUDA optimisation. Defaults to True.
-        holdoff_frames (int | None, optional): Number of minimum frames between r peak predictions. Defaults to 10 (200 ms at 50 Hz).
+        holdoff_frames (int | None, optional): Number of minimum frames between r peak predictions. Defaults to 20 (400 ms at 50 Hz).
 
     Returns:
         List(np.darray, np.darray): Returns probs and preds.

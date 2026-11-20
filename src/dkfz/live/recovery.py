@@ -39,7 +39,7 @@ def recovery_peaks(
     *,
     threshold,
     recovery_threshold,
-    holdoff_frames=10,
+    holdoff_frames=20,
     emission_threshold=None,
 ):
     from dkfz.native import _live_core
@@ -62,7 +62,7 @@ def calibrate_recovery(
     targets,
     selection,
     *,
-    holdoff_frames=10,
+    holdoff_frames=20,
     error_association_frames=1,
     outer_error_association_frames=2,
     exact_tolerance_frames=None,

@@ -182,7 +182,7 @@ def holdoff_frames_from_settings(settings: dict) -> int:
     raw_hz = float(settings["raw_hz"])
     frame_size_raw = int(settings["frame_size_raw"])
     frame_hz = raw_hz / frame_size_raw
-    holdoff_ms = float(settings.get("holdoff_ms", 200.0))
+    holdoff_ms = float(settings.get("holdoff_ms", 400.0))
     return int(np.ceil(holdoff_ms * frame_hz / 1000.0))
 
 

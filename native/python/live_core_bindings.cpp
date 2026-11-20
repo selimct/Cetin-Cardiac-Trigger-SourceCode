@@ -766,6 +766,6 @@ PYBIND11_MODULE(_live_core, module)
             }
             return peaks;
         }, py::arg("probabilities"), py::arg("recovery_probabilities"),
-        py::arg("threshold"), py::arg("recovery_threshold"), py::arg("holdoff_frames") = 10,
+        py::arg("threshold"), py::arg("recovery_threshold"), py::arg("holdoff_frames") = 20,
         py::arg("emission_threshold") = py::none());
 }
