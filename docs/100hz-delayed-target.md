@@ -53,8 +53,7 @@ context relative to the target; it does not guarantee correct classification.
 Candidate positions must refer to F(t-1), while decision/emission timestamps
 refer to Ft or the later frame that actually causes emission. The runtime must
 not backdate emission by one frame. Holdoff and duplicate suppression must use
-actual emission time on the raw-sample axis. A default 200 ms holdoff is 20 new
-frames; the evaluated model's explicit 400 ms holdoff would be 40 new frames.
+actual emission time on the raw-sample axis. The default 400 ms holdoff is 40 frames at 100 Hz.
 Prefer configuring this in milliseconds to avoid ambiguity across model rates.
 
 Keep preprocessing horizons in physical time: ECG normalization still uses the
@@ -107,6 +106,10 @@ a stateful recurrent design would be a separate training/runtime change.
 ## Train the model
 
 Published variants use the same family layout as recovery models:
+
+The following is the layout produced by new training. Included pretrained
+copies use the public `base`, `slope` and `ecg-only` directory names listed in
+the [model table](README.md), while retaining their saved model identifiers.
 
 ```text
 finished_models/ecg3/
@@ -174,8 +177,8 @@ and architecture as its source checkpoint.
 settings by doubling the window and holdoff (`min_distance`),
 pulse-normalization and pulse-quality frame counts. Saved `holdoff_frames` or
 `holdoff_ms` overrides retain their physical duration. Explicit CLI frame counts
-win; an already delayed config is not scaled twice. The default is **20 frames
-= 200 ms**; an explicit new `--min-distance 10` means **100 ms** at 100 Hz.
+win; an already delayed config is not scaled twice. The default is **40 frames
+= 400 ms**; an explicit new `--min-distance 10` means **100 ms** at 100 Hz.
 Runtime `holdoff_frames` always uses the trained model's frame rate.
 
 ## TP, PE and oPE definitions (option 2)

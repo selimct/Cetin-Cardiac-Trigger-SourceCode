@@ -41,6 +41,7 @@ PYTHON_COMMANDS = (
     "run/prep_read_log_to_parquet.py",
     "run/io_uart_bytes_to_parquet.py",
     "run/create_model_table.py",
+    "run/create_metrics_word_tables.py",
     "run/compare_prediction_models.py",
     "run/offline_predict_trt.py",
     "run/check_prepared_model.py",
@@ -151,6 +152,7 @@ def main() -> None:
     args = parser.parse_args()
     for relative in (*PYTHON_COMMANDS, *SHELL_COMMANDS, "run/jetson_check_trt_parity.py",
                      "pyproject.toml", "setup.py", "LICENSE",
+                     "config/lopo_recipes/ecg12.json", "config/word_tables/template.xml",
                      "config/native_uart_live.conf", "deploy/dkfz-native-uart-live.service",
                      "deploy/journald@dkfz-live.conf"):
         require_file(relative, executable=relative in {

@@ -12,6 +12,19 @@ using the `delayed_100hz/` variants by default. They use
 p02 head, p14 heart/head, and p16 head/heart/pelvis. `./metrics.sh` defaults to
 the normal run.
 
+Those six benchmark recordings are supplied separately under `data/true/`;
+they are not part of the included `data/live/` recordings. To evaluate an
+included recording instead, select it explicitly:
+
+```bash
+./create_prediction_metrics.sh --output-dir metrics/live \
+  --model ecg3_delayed_100hz finished_models data/live/p01/p01_out.parquet
+```
+
+Use held-out recordings when assessing performance on patients absent from
+training. Included models retain their saved names; the [model table](README.md)
+lists their public source directories.
+
 ## Model selection
 
 50 Hz models require explicit selection: use `--include-50hz` to include
@@ -37,7 +50,7 @@ For explicit recordings or a custom output root, use the general wrapper:
 
 ```bash
 ./create_prediction_metrics.sh --output-dir metrics/custom \
-  --model ecg3 finished_models data/true/p02/p02_head.parquet \
+  --model ecg3_delayed_100hz finished_models data/true/p02/p02_head.parquet \
   data/true/p14/p14_heart.parquet
 ```
 
@@ -69,7 +82,7 @@ evaluated; the comparison tables retain the other models and the existing Siemen
 baseline. Adding an existing model name replaces its rows without duplicating it.
 
 ```bash
-./metrics.sh normal --add-model slope_ecg3_delayed_100hz --jobs 2
+./metrics.sh normal --add-model slope_slow_ecg3_delayed_100hz --jobs 2
 ```
 
 Use the same input recordings and their size/mtime signatures, variant,
@@ -106,6 +119,99 @@ With `--no-recovery`, saved paths gain a `current_only/` component, for example
 
 ## Reports and metric policy
 
+### Editable Word tables
+
+Add `--word-tables` to export the paper tables as editable, copy-pasteable
+Microsoft Word tables:
+
+```bash
+./metrics.sh normal --word-tables
+./metrics.sh synthetic --word-tables
+```
+
+Both commands update **`metrics/Tables_metrics.docx`**. Each replaces its own
+results section and preserves the other section. On the first export, a section
+without exported results is explicitly marked as pending. The document also
+contains Tables S1–S3 for Base (`ecg3_delayed_100hz`), ECG-only
+(`ecg3_nopuls_delayed_100hz`), and Slope (`slope_slow_ecg3_delayed_100hz`). Only
+these three non-recovery **100 Hz** models appear in Word, even when the general
+benchmark includes other models. The normal table includes the Siemens vendor
+baseline; the synthetic table contains the three models grouped by frequency.
+**90 Hz is omitted from Word**, while the benchmark and CSV/TXT outputs retain
+their existing frequency sweep. Missing model results appear as an em dash.
+
+The export uses pooled event counts and the existing Se/+P/DER calculations,
+with percentages rounded to two decimal places. GT is shown for every model,
+so differing target counts remain visible. Outer position errors are treated
+as FP + FN in Word, including when the CSV retains the optional outer tier.
+Matching tolerances are stated beneath each table; the template's historical
+“No Tolerance” wording is replaced because the 100 Hz exact tier has a tolerance.
+Coverage and the source report path are also recorded.
+
+S tables read the saved model configurations, including normalization, features,
+architecture, input window, training settings, validation and selection policy,
+training patients, detection threshold/holdoff, prediction delay, and matching
+tolerances. These describe the saved configuration; manual prediction overrides
+do not change them. Exporting does not read training caches or run training or
+inference. Gradient updates are marked unrecorded unless saved in the config.
+
+`--output-dir metrics/custom` puts the shared document under that root;
+`--no-recovery` uses its `current_only/` subdirectory. Use
+`--word-output path/to/results.docx` to set an explicit document path (this also
+enables Word export). Use the same document path for both modes. Export runs
+once after recording workers finish, including with `--jobs` and `--add-model`.
+
+Saved reports can also be exported without running the benchmark:
+
+```bash
+./metrics.sh --word-tables-only
+```
+
+This refreshes **both** normal and synthetic tables (and S1–S3), reading
+`metrics/prediction_metrics_overview.csv` and
+`metrics/synthetic/prediction_metrics_overview.csv` by default. In an interactive
+terminal, it lists directories matching `synthetic*` under the report root that
+contain a pooled CSV, and asks which to export. Without a terminal, it uses the
+base `synthetic/` report; if absent, it lists available directories and asks for
+an explicit source. It never starts metric
+evaluation, inference, or plotting. Both reports must exist; missing reports
+produce an error and leave the document intact. `--output-dir` changes the
+common report/document root, and `--word-output` changes the document path.
+`--no-recovery` selects the `current_only/` report subdirectory. The optional
+`normal`/`synthetic` shortcut mode does not limit a tables-only update.
+
+To use a saved synthetic noise experiment, select its report explicitly:
+
+```bash
+./metrics.sh --word-tables-only \
+  --synthetic-dir metrics/synthetic_0p5
+```
+
+Choose the appropriate noise strength; the updater does not silently select an
+experiment. `--synthetic-csv FILE` accepts an exact report file instead of a
+directory, and `--normal-csv FILE` overrides the normal report path.
+`--dry-run` prints only the export command. For a single-section export or
+explicit config paths, the underlying exporter is also available:
+
+```bash
+.venv/bin/python run/create_metrics_word_tables.py \
+  --normal-csv metrics/prediction_metrics_overview.csv \
+  --synthetic-csv metrics/synthetic/prediction_metrics_overview.csv \
+  --output metrics/Tables_metrics.docx
+```
+
+Supply either CSV or both. `--models-root` defaults to `finished_models/`;
+`--model-config MODEL=PATH` can select an explicit evaluated config. The exporter
+also discovers the included `base`, `slope` and `ecg-only` directories by their
+saved model names when the original publication path is absent. The wrapper
+passes its selected config paths automatically. Updating an unrelated Word
+document is rejected to avoid overwriting it.
+
+The reusable layout is included in `config/word_tables/template.xml`, with
+old results and figures removed. Generation
+uses the Python standard library and the project's existing reporting code; no
+Word package or Microsoft Word installation is required.
+
 Reports go under `metrics/` for normal runs and `metrics/synthetic/` for synthetic
 runs. Each has `prediction_metrics_overview.{txt,csv}` for pooled results and
 `prediction_metrics_per_input.{txt,csv}` for per-input comparisons. Synthetic
@@ -121,6 +227,12 @@ These differences are intentional. The
 defines the model-specific frame radii. Use the
 [raw-time comparison](100hz-delayed-target.md#compare-saved-models-on-raw-time)
 for cross-rate comparisons over common valid recording intervals.
+
+The Siemens first-marker baseline uses the same frame-rate policy as the
+model prediction log. At 100 Hz, offsets up to one frame are TP, two to three
+frames are PE, and four to five frames are outer PE. Older tables used a
+one-frame PE radius for Siemens, leaving its PE count at zero at 100 Hz;
+rebuilding the full overview from saved predictions corrects those counts.
 
 ## Synthetic gradient benchmarks
 

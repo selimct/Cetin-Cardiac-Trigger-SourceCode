@@ -8,7 +8,6 @@
 
 [![Build and distribution check](https://github.com/selimct/Cetin-Cardiac-Trigger-SourceCode/actions/workflows/build.yml/badge.svg)](https://github.com/selimct/Cetin-Cardiac-Trigger-SourceCode/actions/workflows/build.yml)
 [![Trigger GUI](https://raw.githubusercontent.com/selimct/DKFZ-MRI-Cardiac-Trigger-GUI/refs/heads/main/packaging/github-badge.svg)](https://github.com/selimct/DKFZ-MRI-Cardiac-Trigger-GUI)
-[![ECG/POX Data](https://raw.githubusercontent.com/selimct/DKFZ-MRI-Cardiac-Trigger-GUI/refs/heads/main/packaging/data-badge.svg)](https://github.com/selimct/Cetin-UHF-ECGPOX-Data.git)
 [![ParquetPlot](https://raw.githubusercontent.com/selimct/ParquetPlot/refs/heads/main/resources/parquetplot-gitlab-badge.svg)](https://github.com/selimct/ParquetPlot)
 
 This project presents a machine-learning-based hybrid ECG-POX R-peak detector for real-time cardiac triggering in ultra-high-field MRI. It was developed by Furkan Selim Cetin as part of their master's thesis at DKFZ Heidelberg.
@@ -16,9 +15,10 @@ This project presents a machine-learning-based hybrid ECG-POX R-peak detector fo
 The repository includes the research workflow and the real-time triggering system, from recorded physiological signals to a trained model and its use during live acquisition.
 
 This public distribution includes setup, data preparation, model training,
-evaluation, deployment and live operation. Recordings and trained model
-artifacts are supplied separately; `models/`, `finished_models/` and metric
-outputs are created or populated by the user. Development test suites,
+evaluation, deployment and live operation. Annotated recordings are included
+under `data/live/`, with delayed 100 Hz models under `finished_models/base/`,
+`finished_models/slope/` and `finished_models/ecg-only/`. Training and metric
+outputs are generated locally. Development test suites,
 internal patches and deprecated executables are omitted.
 
 ## Project scope

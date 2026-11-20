@@ -43,7 +43,7 @@ the plotting dependencies from the training extras. For example:
 
 New training defaults to a single delayed 100 Hz primary output: four raw
 samples per frame, a 100-frame one-second window, and one subsequent frame of
-context. The default holdoff is 200 ms (`min_distance=20`). Saved configurations
+context. The default holdoff is 400 ms (`min_distance=40`). Saved configurations
 retain their declared timing, architecture, and explicit holdoff settings.
 
 The recipe wrapper trains and publishes the five delayed model families:
@@ -54,7 +54,7 @@ The recipe wrapper trains and publishes the five delayed model families:
 ```
 
 `delayed-100hz` remains an alias for the default. Use `normal` to explicitly
-train 50 Hz current-frame models (`min_distance=10` for the same 200 ms holdoff):
+train 50 Hz current-frame models (`min_distance=20` for the same 400 ms holdoff):
 
 ```bash
 ./train_models_lopo.sh normal --only ecg3 --dry-run
@@ -73,11 +73,38 @@ The run is named `ecg3_nopuls_delayed_100hz`, with training outputs under
 `models/lopo_nopuls_delayed_100hz_metrics_overview.txt`. The flag also works
 with the wrapper's `normal` and joint `recovery` modes.
 
+To train at 100 Hz using only ECG1 and ECG2 (no ECG3 or pulse input):
+
+```bash
+./train_models_lopo.sh delayed-100hz --only ecg12 --nopuls
+```
+
+This selects the optional `ecg12` recipe and publishes
+`ecg12_nopuls_delayed_100hz` under `finished_models/ecg12_nopuls/delayed_100hz/`.
+Training outputs go under `models/ecg12_nopuls_delayed_100hz_cv/nested_lopo/`.
+The window defaults to one second. Add `--window-size 600` for six seconds
+and the separate name `ecg12_nopuls_ws600_delayed_100hz`.
+
 Direct Python training defaults to delayed 100 Hz too. Select
 `--prediction-mode current` for fresh 50 Hz training, or explicitly provide an
 existing 50 Hz configuration. See the [100 Hz guide](100hz-delayed-target.md)
 for targets, physical histories, publication paths, and the frame-tier metric
 policy. Use new model names when changing an existing model's target contract.
+
+To train ECG3 at 100 Hz with a six-second sliding window (600 frames):
+
+```bash
+./train_models_lopo.sh delayed-100hz --only ecg3 --window-size 600
+```
+
+This uses the recipe's 400 ms holdoff (`min_distance=40`) and includes pulse
+input. Add `--nopuls` to disable pulse input. Results are written under
+`models/ecg3_ws600_delayed_100hz_cv/nested_lopo/` and published under
+`finished_models/ecg3_ws600/delayed_100hz/`. The window override uses frames at
+the selected model rate and takes precedence over the recipe's window size.
+An explicit `--window-size N` adds `_wsN` before the mode suffix; combined with
+`--nopuls`, the name is `ecg3_nopuls_ws600_delayed_100hz`. Metrics summaries
+also include the window suffix. Omitting the option keeps the existing names.
 
 Recovery is excluded by default. Joint recovery requires
 `./train_models_lopo.sh recovery` (or `--recovery-head`); frozen recovery scripts
@@ -122,22 +149,9 @@ the deployment engine is built on the Jetson.
 
 ## Use the annotated dataset
 
-Part of the annotated data is available in the
-[ECG/POX Data repository](https://github.com/selimct/Cetin-UHF-ECGPOX-Data),
-linked by the data badge in the project's README:
-
-[![ECG/POX Data](https://raw.githubusercontent.com/selimct/DKFZ-MRI-Cardiac-Trigger-GUI/refs/heads/main/packaging/data-badge.svg)](https://github.com/selimct/Cetin-UHF-ECGPOX-Data)
-
-The dataset is maintained as its own repository with the same structure as
-`data/live/`: patient folders sit directly at its root. For a fresh data
-directory, clone it into this project with:
-
-```bash
-git clone https://github.com/selimct/Cetin-UHF-ECGPOX-Data.git data/live
-```
-
-This places recordings under paths such as `data/live/p01/p01_out.parquet`.
-These files are already annotated; continue with
+This distribution includes 45 annotated Parquet recordings under `data/live/`,
+grouped by patient, for example `data/live/p01/p01_out.parquet`.
+These files are ready for
 [patient grouping](#group-recordings-by-patient) and training. The next section
 covers preparing additional recordings yourself.
 

@@ -31,6 +31,23 @@ Examples use `my_model_cv`, produced by
 the [LOPO training workflow](training.md) with base name `my_model`. Replace the
 model name and source directory together when using your own model.
 
+The included delayed 100 Hz models can be used without training:
+
+| Model | Saved model name | Source directory |
+| --- | --- | --- |
+| Base | `ecg3_delayed_100hz` | `finished_models/base/delayed_100hz/` |
+| Slope | `slope_slow_ecg3_delayed_100hz` | `finished_models/slope/delayed_100hz/` |
+| ECG-only | `ecg3_nopuls_delayed_100hz` | `finished_models/ecg-only/delayed_100hz/` |
+
+The public directory names preserve each model's original training metadata.
+Select its saved model name in commands and use the matching source directory.
+For example, prepare Base on the workstation with:
+
+```bash
+./prepare_model.sh ecg3_delayed_100hz \
+    --model-dir finished_models/base/delayed_100hz --workstation-only
+```
+
 ## Project layout
 
 ```text
@@ -46,7 +63,8 @@ live_stack/
 ├── config/                  Runtime and acquisition settings
 ├── deploy/                  Service template and active model slot
 ├── data/                    Recordings and prepared datasets
-│   └── live/                Annotated dataset repository, grouped by patient
+│   └── live/                Included annotated recordings, grouped by patient
+├── finished_models/         Included Base, Slope and ECG-only delayed models
 ├── models/                  Training outputs, configurations, and predictions
 ├── build_native/            Generated native executables
 └── docs/                    User guides and terminal alternatives
